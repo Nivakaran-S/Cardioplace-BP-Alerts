@@ -31,20 +31,47 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout with full history and LFS
+      # A Space is a deployment target, not a history mirror. Only the current tree
+      # is checked out, so only the LFS objects HEAD actually references are fetched.
+      # Pushing full history would additionally demand every historical LFS object --
+      # including the one the pre-migrate root commit points at, which is a different
+      # blob, is not on this runner, and is not needed to run the app.
+      - name: Checkout current tree with LFS
         uses: actions/checkout@v4
         with:
-          # A Space push needs real history, and data/vip.csv is a 250 MB LFS object.
-          fetch-depth: 0
+          fetch-depth: 1
           lfs: true
 
-      - name: Fetch LFS objects
-        run: git lfs pull
-
-      - name: Configure git
+      - name: Verify LFS payloads are real content, not pointers
         run: |
+          set -euo pipefail
+          git lfs install --local
+          git lfs pull
+          fail=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            if head -c 40 "$f" | grep -q "^version https://git-lfs"; then
+              echo "::error::$f is still an LFS pointer -- the Space would get a stub file"
+              fail=1
+            else
+              echo "  ok  $f ($(du -h "$f" | cut -f1))"
+            fi
+          done < <(git lfs ls-files -n)
+          exit $fail
+
+      - name: Build the deploy commit
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Orphan branch: one root commit holding exactly the current tree. This is
+          # what makes the push self-contained -- it references no historical object.
+          git checkout --orphan deploy
+          git add -A
+          git commit -q -m "Deploy ${GITHUB_SHA::7} from ${GITHUB_REPOSITORY}"
+          echo "tracked files: $(git ls-files | wc -l)"
+          echo "LFS objects:   $(git lfs ls-files | wc -l)"
 
       - name: Push to the Space
         env:
@@ -52,18 +79,15 @@ jobs:
         run: |
           set -euo pipefail
           SPACE_URL="https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE}"
-
           git remote add space "$SPACE_URL" 2>/dev/null || git remote set-url space "$SPACE_URL"
-          git lfs install --local
 
-          # The Space's own history is unrelated to this repo's, so the first push
-          # replaces it wholesale. Every later push is an ordinary fast-forward of
-          # the same branch, which is why --force is safe here rather than routine.
-          git push --force space HEAD:main
+          # Each deploy replaces the Space's branch with this single commit, so the
+          # push is a history rewrite by design rather than a fast-forward.
+          git push --force space deploy:main
 
       - name: Summary
         if: success()
         run: |
           echo "### Deployed to HuggingFace" >> $GITHUB_STEP_SUMMARY
           echo "Space: https://huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE}" >> $GITHUB_STEP_SUMMARY
-          echo "Commit: \`${GITHUB_SHA::7}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Source commit: \`${GITHUB_SHA::7}\`" >> $GITHUB_STEP_SUMMARY
