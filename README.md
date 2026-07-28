@@ -11,6 +11,11 @@ app_file: app.py
 python_version: "3.12"
 pinned: false
 short_description: BP forecasting, personalisation and early warning on HEMOBP
+# Run this on CPU basic (free). The stack is scikit-learn end to end and has no
+# GPU path, so ZeroGPU refuses it at startup with "No @spaces.GPU function
+# detected". This key is only a hint for anyone duplicating the Space -- the
+# running Space's tier is set in its own Settings and cannot be changed from here.
+suggested_hardware: cpu-basic
 ---
 
 # Cardioplace BP Alerts
