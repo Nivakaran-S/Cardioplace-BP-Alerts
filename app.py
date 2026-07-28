@@ -13,6 +13,7 @@ import sys
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
+import gradio as gr
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -238,7 +239,100 @@ def train(background_tasks: BackgroundTasks):
             "note": "a full run takes tens of minutes; poll /api/health for model_loaded"}
 
 
+# ------------------------------------------------------------ gradio surface
+
+# The Space runs on the Gradio SDK, which ignores the Dockerfile and simply executes
+# `python app.py`. Mounting Gradio onto the FastAPI app keeps one uvicorn process
+# serving everything: the dashboard at /, the REST API at /api/*, and Gradio at
+# /gradio. A native Gradio-only app would have meant discarding templates/.
+
+def _parse_readings(raw: str):
+    """Parse the `YYYY-MM-DD, SBP, DBP` block the Gradio textbox accepts."""
+    rows, errors = [], []
+    for i, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.replace("\t", ",").replace(";", ",").split(",")]
+        if len(parts) < 3:
+            errors.append(f"line {i}: expected date, SBP, DBP")
+            continue
+        try:
+            rows.append(Reading(ts=parts[0], sbp=float(parts[1]), dbp=float(parts[2])))
+        except Exception as exc:
+            errors.append(f"line {i}: {exc.__class__.__name__}")
+    return rows, errors
+
+
+def _gradio_predict(readings_text, patient_id, age, sex, dm):
+    if not STORE.ready:
+        return f"### No model loaded\n\n{STORE.error}", {}
+    rows, errors = _parse_readings(readings_text or "")
+    if errors:
+        return "### Could not parse the readings\n\n- " + "\n- ".join(errors[:5]), {}
+    if not rows:
+        return "### Enter at least one reading", {}
+
+    req = PredictRequest(patient_id=patient_id or "demo", age=float(age),
+                         is_male=1 if sex == "Male" else 0,
+                         is_dm=1 if dm == "Yes" else 0, readings=rows)
+    advisory = STORE.predictor.predict(_history_frame(req))
+
+    pers = advisory.get("personalisation", {})
+    ew = advisory.get("early_warning") or {}
+    lines = [
+        f"### {advisory['patient_id']} — {advisory['confidence_tier'].replace('_', ' ')}",
+        "",
+        f"**Personalised threshold** {pers.get('threshold')} mmHg "
+        f"(offset {pers.get('offset'):+} mmHg"
+        + (", bound by the governance cap" if pers.get("capped") else "") + ")  ",
+        f"**Emergency floor** {advisory.get('emergency_floor_mmHg')} mmHg — never personalised  ",
+        f"**Observations** {advisory.get('n_observations')}",
+    ]
+    fc = (advisory.get("forecast") or {}).get("sbp") or {}
+    if fc:
+        lines += ["", "| Horizon | SBP | 80% interval |", "|---|---|---|"]
+        for k in sorted(fc, key=lambda k: fc[k]["steps_ahead"]):
+            f = fc[k]
+            band = (f"{f['lo80']} – {f['hi80']}" if f.get("lo80") is not None else "—")
+            lines.append(f"| +{f['steps_ahead']} sessions | {f['point']} mmHg | {band} |")
+    else:
+        lines += ["", f"_{advisory.get('note', 'no forecast issued')}_"]
+    if ew:
+        lines += ["", f"**Early warning** {'FLAGGED' if ew['flagged'] else 'not flagged'} — "
+                      f"score {ew['score']} vs cut {ew['cut']}, est. lead {ew['est_lead_days']} d"]
+    return "\n".join(lines), advisory
+
+
+with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False) as demo:
+    gr.Markdown(
+        "## Cardioplace BP Alerts\n"
+        "Blood-pressure forecasting, personalisation and early warning on HEMOBP. "
+        "The full dashboard is at [/](/) and the REST API at `/api/predict`."
+    )
+    with gr.Row():
+        with gr.Column(scale=2):
+            g_readings = gr.Textbox(
+                label="Session readings", lines=12,
+                info="One per line: YYYY-MM-DD, SBP, DBP",
+                value="\n".join(
+                    f"2026-01-{d:02d}, {150 + (d % 7)}, {78 + (d % 5)}" for d in range(1, 26)))
+        with gr.Column(scale=1):
+            g_pid = gr.Textbox(label="Patient ID", value="demo-001")
+            g_age = gr.Number(label="Age", value=68, minimum=18, maximum=110)
+            g_sex = gr.Radio(["Female", "Male"], label="Sex", value="Male")
+            g_dm = gr.Radio(["No", "Yes"], label="Diabetes", value="No")
+            g_btn = gr.Button("Get advisory", variant="primary")
+    g_summary = gr.Markdown()
+    with gr.Accordion("Raw advisory", open=False):
+        g_json = gr.JSON()
+
+    g_btn.click(_gradio_predict, [g_readings, g_pid, g_age, g_sex, g_dm], [g_summary, g_json])
+
+app = gr.mount_gradio_app(app, demo, path="/gradio")
+
+
 if __name__ == "__main__":
     import uvicorn
-    # 7860 is the port HuggingFace Spaces expects; PORT overrides it elsewhere.
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "7860")))
+    # 7860 is the port HuggingFace Spaces proxies; PORT overrides it elsewhere.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))

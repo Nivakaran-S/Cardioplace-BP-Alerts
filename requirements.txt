@@ -13,6 +13,9 @@ mlflow
 dagshub
 
 # --- serving (app.py) ---
+# The Space runs the Gradio SDK, which installs gradio itself from the
+# sdk_version in README.md; it is pinned here too so a local run matches.
+gradio==5.36.2
 fastapi
 uvicorn[standard]
 jinja2

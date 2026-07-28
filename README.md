@@ -3,14 +3,11 @@ title: Cardioplace BP Alerts
 emoji: 🩺
 colorFrom: blue
 colorTo: red
-sdk: docker
-app_port: 7860
+sdk: gradio
+sdk_version: 5.36.2
+app_file: app.py
 pinned: false
 short_description: BP forecasting, personalisation and early warning on HEMOBP
-# CPU only: the stack is scikit-learn end to end, nothing here uses a GPU.
-# ZeroGPU is Gradio-only and cannot be selected on a Docker Space -- picking it
-# fails the build with "ZeroGPU is only available on Gradio SDK".
-suggested_hardware: cpu-basic
 ---
 
 # Cardioplace BP Alerts
@@ -45,16 +42,24 @@ python app.py      # serve: dashboard + API on http://localhost:7860
 Training takes tens of minutes: `data/vip.csv` is ~250 MB / 4.4M readings, streamed
 in 1M-row chunks, and the run includes a forward-chained random search.
 
-### API
+### Routes
 
 | Route | Purpose |
 |---|---|
-| `GET /` | Dashboard |
+| `GET /` | Dashboard (`templates/`, served by FastAPI) |
+| `GET /gradio` | Gradio interface over the same predictor |
 | `GET /api/health` | Liveness and whether a model is loaded |
 | `GET /api/model` | Model version, selected families, governance parameters |
 | `POST /api/predict` | A patient's session history → the full advisory |
 | `POST /api/reload` | Reload the newest bundle from disk |
 | `POST /api/train` | Kick off a training run in the background |
+
+### How it is hosted
+
+The Space runs the **Gradio SDK**, which ignores the `Dockerfile` and simply executes
+`app.py`. Gradio is therefore mounted onto the FastAPI app rather than the other way
+round, so one uvicorn process serves the dashboard, the REST API and the Gradio
+interface together. The `Dockerfile` is kept for running the same app anywhere else.
 
 ```bash
 curl -X POST localhost:7860/api/predict -H "Content-Type: application/json" -d '{
