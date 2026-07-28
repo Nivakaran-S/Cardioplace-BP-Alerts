@@ -59,6 +59,28 @@ jobs:
           done < <(git lfs ls-files -n)
           exit $fail
 
+      # HuggingFace rejects any non-LFS file over 10 MiB. GitHub's limit is 100 MB, so
+      # a file can sit happily on GitHub and still be refused here. Fail with the
+      # filename rather than letting the remote's pre-receive hook decline the push.
+      - name: Check no plain file exceeds the 10 MiB Space limit
+        run: |
+          set -euo pipefail
+          limit=$((10 * 1024 * 1024))
+          fail=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            sz=$(stat -c%s "$f")
+            [ "$sz" -le "$limit" ] && continue
+            if git check-attr filter -- "$f" | grep -q 'filter: lfs'; then
+              echo "  ok  $f ($((sz / 1048576)) MiB, LFS)"
+            else
+              echo "::error::$f is $((sz / 1048576)) MiB and not tracked by LFS."
+              echo "::error::Run: git lfs track \"$f\" && git add --renormalize \"$f\""
+              fail=1
+            fi
+          done < <(git ls-files)
+          exit $fail
+
       - name: Build the deploy commit
         run: |
           set -euo pipefail
