@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 
 import gradio as gr
+import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -186,6 +187,49 @@ def _history_frame(req: PredictRequest) -> pd.DataFrame:
     return df
 
 
+def _anomaly_series(predictor: BPPredictor, history: pd.DataFrame) -> dict:
+    """Early-warning detector score at every session, not just at 'now'.
+
+    `predict` returns a single score, which cannot show whether a patient is
+    drifting toward the cut or sitting steadily below it. The batch feature
+    builder is used here rather than transform_for_inference in a loop: one pass
+    over the history instead of one rebuild per session.
+
+    Scores early in the series are computed from mostly-absent history and are
+    imputed to training medians, so they say little -- the response marks how many
+    of them precede the cold-start floor and the UI dims that stretch.
+    """
+    det = predictor.b["detector"]
+    g = history.sort_values("ts").copy()
+    g["series_id"] = str(g.patient_id.iloc[0])
+    g["days_since_last"] = g.ts.diff().dt.days.fillna(2).clip(1, 30)
+    g["step"] = np.arange(len(g))
+    g["is_weekend"] = (g.ts.dt.dayofweek >= 5).astype(int)
+
+    F = predictor.fb.transform(g)
+    X = det["imputer"].transform(F.reindex(columns=det["cols"]))
+    scores = -det["model"].score_samples(X)
+
+    cut = float(det["cut"])
+    points = [
+        {"ts": t.strftime("%Y-%m-%d"), "score": round(float(s), 4),
+         "flagged": bool(s >= cut), "warmup": i < predictor.config.cold_start_min_readings}
+        for i, (t, s) in enumerate(zip(F.ts, scores))
+    ]
+    settled = [p for p in points if not p["warmup"]]
+    return {
+        "points": points,
+        "cut": round(cut, 4),
+        "budget_pct": det["budget_pct"],
+        "n_flagged": sum(1 for p in settled if p["flagged"]),
+        "n_settled": len(settled),
+        "warmup_sessions": len(points) - len(settled),
+        "event_definition": (f"SBP exceeds this patient's own p"
+                             f"{int(det['event_quantile'] * 100)} within the next "
+                             f"{det['warn_window']} sessions"),
+    }
+
+
 def _require_model() -> BPPredictor:
     if not STORE.ready:
         raise HTTPException(503, STORE.error or "model not loaded")
@@ -258,6 +302,12 @@ def predict(req: PredictRequest):
         {"ts": r.ts.strftime("%Y-%m-%d"), "sbp": float(r.sbp), "dbp": float(r.dbp)}
         for r in history.itertuples()
     ]
+    try:
+        advisory["anomaly"] = _anomaly_series(predictor, history)
+    except Exception as exc:
+        # The trend is a diagnostic view; losing it must not cost the advisory.
+        logging.warning("anomaly series unavailable: %s", exc)
+        advisory["anomaly"] = None
     return JSONResponse(advisory)
 
 

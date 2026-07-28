@@ -85,6 +85,16 @@
       </div>
 
       <div id="output" hidden>
+        <!-- headline assessment -->
+        <div id="banner" class="banner" role="status">
+          <span id="banner-icon" class="banner-icon" aria-hidden="true"></span>
+          <div class="banner-body">
+            <p id="banner-title" class="banner-title"></p>
+            <p id="banner-detail" class="banner-detail"></p>
+          </div>
+          <span id="banner-meta" class="banner-meta"></span>
+        </div>
+
         <!-- stat tiles -->
         <div class="tiles">
           <article class="tile">
@@ -100,6 +110,10 @@
           <article class="tile">
             <p class="tile-label">Early warning</p>
             <p class="tile-value"><span id="v-ew-chip" class="chip">–</span></p>
+            <div class="meter" id="v-ew-meter" hidden>
+              <div class="meter-track"><div id="v-ew-fill" class="meter-fill"></div></div>
+              <p class="meter-scale"><span id="v-ew-score">–</span><span>cut <span id="v-ew-cut">–</span></span></p>
+            </div>
             <p id="v-ew-note" class="tile-note"></p>
           </article>
         </div>
@@ -124,6 +138,33 @@
                 <caption class="sr-only">Observed and forecast systolic blood pressure</caption>
                 <thead><tr><th scope="col">Session date</th><th scope="col">SBP (mmHg)</th>
                   <th scope="col">DBP (mmHg)</th><th scope="col">Series</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </details>
+        </article>
+
+        <!-- anomaly trend -->
+        <article class="panel" id="anomaly-panel">
+          <div class="panel-head">
+            <div>
+              <h3>Early-warning detector</h3>
+              <p class="hint" id="anomaly-sub"></p>
+            </div>
+            <div class="legend" id="anomaly-legend"></div>
+          </div>
+          <div class="chart-scroll">
+            <div id="anomaly-chart" class="chart" role="img" aria-labelledby="anomaly-desc"></div>
+          </div>
+          <p id="anomaly-desc" class="sr-only"></p>
+          <p id="anomaly-headroom" class="callout"></p>
+          <details class="table-view">
+            <summary>View as table</summary>
+            <div class="table-scroll">
+              <table id="anomaly-table">
+                <caption class="sr-only">Detector score per session</caption>
+                <thead><tr><th scope="col">Session date</th><th scope="col">Score</th>
+                  <th scope="col">Cut</th><th scope="col">State</th></tr></thead>
                 <tbody></tbody>
               </table>
             </div>

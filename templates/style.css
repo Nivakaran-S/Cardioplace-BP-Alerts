@@ -206,6 +206,55 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, .btn:focus-vi
   background: color-mix(in srgb, var(--status-critical) 7%, transparent);
 }
 
+/* ---------------------------------------------------------------- banner */
+
+.banner {
+  display: flex; align-items: flex-start; gap: 13px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  border-radius: var(--radius);
+  padding: 14px 16px; margin-bottom: 20px;
+}
+.banner-good     { border-left-color: var(--status-good); }
+.banner-watch    { border-left-color: var(--status-warning); }
+.banner-critical { border-left-color: var(--status-critical); }
+
+.banner-icon { font-size: 1.1rem; line-height: 1.35; flex: none; }
+.banner-body { flex: 1; min-width: 0; }
+.banner-title { margin: 0; font-weight: 600; font-size: 0.95rem; color: var(--text-primary); }
+.banner-detail { margin: 3px 0 0; font-size: 0.83rem; color: var(--text-secondary); }
+.banner-meta {
+  font-size: 0.74rem; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap; flex: none;
+}
+
+/* ------------------------------------------------------------ meter/callout */
+
+.meter { margin-top: 9px; }
+.meter-track {
+  height: 5px; border-radius: 3px; overflow: hidden;
+  background: color-mix(in srgb, var(--text-muted) 22%, transparent);
+}
+.meter-fill {
+  height: 100%; border-radius: 3px; width: 0;
+  background: var(--status-good); transition: width .25s ease;
+}
+.meter-fill.over { background: var(--status-critical); }
+.meter-scale {
+  display: flex; justify-content: space-between; gap: 8px;
+  margin: 4px 0 0; font-size: 0.72rem; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.callout {
+  margin: 12px 0 0; padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--plane);
+  border: 1px solid var(--border);
+  font-size: 0.8rem; color: var(--text-secondary);
+}
+
 /* ----------------------------------------------------------------- tiles */
 
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
