@@ -1,3 +1,4 @@
+# --- pipeline ---
 numpy
 pandas
 scikit-learn
@@ -6,5 +7,14 @@ pyyaml
 joblib
 pyarrow
 python-dotenv
+
+# --- experiment tracking ---
 mlflow
 dagshub
+
+# --- serving (app.py) ---
+fastapi
+uvicorn[standard]
+jinja2
+pydantic
+python-multipart

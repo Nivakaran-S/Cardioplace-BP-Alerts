@@ -16,7 +16,10 @@ wheels/
 # Pipeline run outputs
 Artifacts/
 logs/
-final_model/
+
+# The serving bundle ships: without it the deployed Space has no model to load.
+final_model/*
+!final_model/model.pkl
 
 # MLflow local tracking store (created when MLFLOW_TRACKING_URI is unset)
 mlruns/

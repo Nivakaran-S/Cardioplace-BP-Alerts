@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cardioplace BP Alerts</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>Cardioplace BP Alerts</h1>
+        <p class="brand-sub">Blood-pressure forecasting, personalisation and early warning</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="model-chip" class="chip chip-muted">checking model…</span>
+      <button id="theme-toggle" class="btn btn-ghost" type="button" aria-label="Toggle theme">
+        <span data-theme-icon>◐</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ------------------------------------------------------------ input -->
+    <section class="panel" aria-labelledby="input-h">
+      <h2 id="input-h">Patient</h2>
+
+      <div class="field-row">
+        <label class="field">
+          <span>Patient ID</span>
+          <input id="patient-id" type="text" value="demo-001" autocomplete="off">
+        </label>
+        <label class="field field-sm">
+          <span>Age</span>
+          <input id="age" type="number" min="18" max="110" value="68">
+        </label>
+      </div>
+
+      <div class="field-row">
+        <label class="field">
+          <span>Sex</span>
+          <select id="sex">
+            <option value="0">Female</option>
+            <option value="1" selected>Male</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Diabetes</span>
+          <select id="dm">
+            <option value="0" selected>No</option>
+            <option value="1">Yes</option>
+          </select>
+        </label>
+      </div>
+
+      <label class="field">
+        <span>
+          Session readings
+          <em class="hint">one per line — <code>YYYY-MM-DD, SBP, DBP</code></em>
+        </span>
+        <textarea id="readings" rows="12" spellcheck="false"></textarea>
+      </label>
+
+      <p id="reading-count" class="hint" aria-live="polite"></p>
+
+      <div class="actions">
+        <button id="btn-predict" class="btn btn-primary" type="button">Get advisory</button>
+        <button id="btn-sample" class="btn btn-ghost" type="button">Load sample</button>
+      </div>
+
+      <p id="form-error" class="alert alert-error" hidden></p>
+    </section>
+
+    <!-- ----------------------------------------------------------- output -->
+    <section class="results" aria-labelledby="results-h" aria-busy="false">
+      <h2 id="results-h" class="sr-only">Advisory</h2>
+
+      <div id="empty-state" class="panel empty">
+        <p class="empty-title">No advisory yet</p>
+        <p class="hint">Enter a patient's session history and select <strong>Get advisory</strong>.
+           The model needs at least 7 readings before it will issue a forecast.</p>
+      </div>
+
+      <div id="output" hidden>
+        <!-- stat tiles -->
+        <div class="tiles">
+          <article class="tile">
+            <p class="tile-label">Personalised threshold</p>
+            <p class="tile-value"><span id="v-threshold">–</span><span class="unit">mmHg</span></p>
+            <p id="v-threshold-note" class="tile-note"></p>
+          </article>
+          <article class="tile">
+            <p class="tile-label">Confidence tier</p>
+            <p class="tile-value"><span id="v-tier">–</span></p>
+            <p id="v-tier-note" class="tile-note"></p>
+          </article>
+          <article class="tile">
+            <p class="tile-label">Early warning</p>
+            <p class="tile-value"><span id="v-ew-chip" class="chip">–</span></p>
+            <p id="v-ew-note" class="tile-note"></p>
+          </article>
+        </div>
+
+        <!-- chart -->
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Systolic blood pressure</h3>
+              <p class="hint" id="chart-sub">Observed history and forecast, per dialysis session</p>
+            </div>
+            <div class="legend" id="legend"></div>
+          </div>
+          <div class="chart-scroll">
+            <div id="chart" class="chart" role="img" aria-labelledby="chart-desc"></div>
+          </div>
+          <p id="chart-desc" class="sr-only"></p>
+          <details class="table-view">
+            <summary>View as table</summary>
+            <div class="table-scroll">
+              <table id="chart-table">
+                <caption class="sr-only">Observed and forecast systolic blood pressure</caption>
+                <thead><tr><th scope="col">Session date</th><th scope="col">SBP (mmHg)</th>
+                  <th scope="col">DBP (mmHg)</th><th scope="col">Series</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </details>
+        </article>
+
+        <!-- forecast detail -->
+        <article class="panel">
+          <h3>Forecast horizons</h3>
+          <div class="table-scroll">
+            <table id="forecast-table">
+              <thead><tr>
+                <th scope="col">Horizon</th><th scope="col">Point (mmHg)</th>
+                <th scope="col">80% interval</th><th scope="col">Days ahead</th>
+                <th scope="col">vs threshold</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="interval-basis" class="hint"></p>
+        </article>
+
+        <!-- governance -->
+        <article class="panel governance">
+          <h3>Governance</h3>
+          <ul class="gov-list">
+            <li><span class="gov-key">Emergency floor</span>
+                <span id="v-floor" class="gov-val">–</span>
+                <span class="hint">never personalised — the rule engine fires regardless</span></li>
+            <li><span class="gov-key">Population threshold</span>
+                <span id="v-pop" class="gov-val">–</span>
+                <span class="hint">the offset is applied against this, within capped bounds</span></li>
+            <li><span class="gov-key">Model version</span>
+                <span id="v-version" class="gov-val mono">–</span></li>
+          </ul>
+          <p class="disclaimer">
+            Provider-visible decision support. This is not a DeviationAlert and does not
+            replace the deterministic rule engine.
+          </p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

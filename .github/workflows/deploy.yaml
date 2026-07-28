@@ -1,0 +1,69 @@
+name: Deploy to HuggingFace Space
+
+# Workflows only run from .github/workflows/ — a file at .github/deploy.yaml is
+# never picked up by Actions.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      # Set these as repository secrets under Settings -> Secrets and variables -> Actions.
+      #   HF_TOKEN     a HuggingFace access token with WRITE permission
+      #   HF_USERNAME  the account or org that owns the Space
+      #   HF_SPACE     the Space name (not the full URL)
+      HF_USERNAME: ${{ secrets.HF_USERNAME }}
+      HF_SPACE: ${{ secrets.HF_SPACE }}
+
+    steps:
+      - name: Check required secrets
+        run: |
+          missing=""
+          [ -z "${{ secrets.HF_TOKEN }}" ] && missing="$missing HF_TOKEN"
+          [ -z "${{ secrets.HF_USERNAME }}" ] && missing="$missing HF_USERNAME"
+          [ -z "${{ secrets.HF_SPACE }}" ] && missing="$missing HF_SPACE"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing"
+            exit 1
+          fi
+
+      - name: Checkout with full history and LFS
+        uses: actions/checkout@v4
+        with:
+          # A Space push needs real history, and data/vip.csv is a 250 MB LFS object.
+          fetch-depth: 0
+          lfs: true
+
+      - name: Fetch LFS objects
+        run: git lfs pull
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Push to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          SPACE_URL="https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE}"
+
+          git remote add space "$SPACE_URL" 2>/dev/null || git remote set-url space "$SPACE_URL"
+          git lfs install --local
+
+          # The Space's own history is unrelated to this repo's, so the first push
+          # replaces it wholesale. Every later push is an ordinary fast-forward of
+          # the same branch, which is why --force is safe here rather than routine.
+          git push --force space HEAD:main
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "### Deployed to HuggingFace" >> $GITHUB_STEP_SUMMARY
+          echo "Space: https://huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE}" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: \`${GITHUB_SHA::7}\`" >> $GITHUB_STEP_SUMMARY
