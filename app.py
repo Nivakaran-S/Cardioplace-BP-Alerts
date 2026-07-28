@@ -6,6 +6,7 @@ training-time globals are read, so this process runs anywhere the artifact goes.
 """
 
 import glob
+import importlib.util
 import os
 import pickle
 import subprocess
@@ -30,29 +31,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
 
-# ----------------------------------------------------- ZeroGPU compatibility
-# This pipeline is scikit-learn end to end and has no GPU path, so cpu-basic is
-# the right tier. A Space left on ZeroGPU, however, terminates at startup with
-# "No @spaces.GPU function detected" -- it treats a GPU Space with no GPU entry
-# point as a misconfiguration and refuses to serve.
+# ------------------------------------------------------------- tier check
+# This pipeline is scikit-learn end to end and has no GPU path, so the Space must
+# run on cpu-basic. ZeroGPU is not a supported target: its supervisor terminates
+# this app shortly after startup, and a bare @spaces.GPU entry point does not
+# satisfy it -- ZeroGPU expects GPU work reachable from a Gradio event, which
+# would mean routing every CPU prediction through a GPU allocation queue.
 #
-# `spaces` is injected by HuggingFace only on a ZeroGPU Space, so its presence
-# is a reliable signal for that tier. Registering one trivial entry point there
-# satisfies the check and lets the app run on either tier unchanged. On
-# cpu-basic the import fails and nothing below happens.
-try:
-    import spaces as _spaces
-except Exception:
-    _spaces = None
-
-if _spaces is not None:
-    logging.info("ZeroGPU tier detected; registering a no-op GPU entry point. "
-                 "cpu-basic is the correct tier for this app -- nothing here uses a GPU.")
-
-    @_spaces.GPU(duration=1)
-    def _zerogpu_entrypoint():
-        """Exists only to satisfy ZeroGPU's startup probe. Never called by the app."""
-        return "cpu-only workload"
+# The Space's tier lives in its own Settings and cannot be set from this
+# repository, so the most this code can do is name the problem clearly in the log
+# instead of exiting for no visible reason.
+if os.getenv("SPACE_ID") and importlib.util.find_spec("spaces") is not None:
+    logging.error(
+        "This Space is on ZeroGPU, which will terminate the container shortly after "
+        "startup. Nothing in this app uses a GPU. Set Settings -> Space hardware to "
+        "'CPU basic' and rebuild."
+    )
 
 
 @asynccontextmanager
