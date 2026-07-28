@@ -59,26 +59,36 @@ jobs:
           done < <(git lfs ls-files -n)
           exit $fail
 
-      # HuggingFace rejects any non-LFS file over 10 MiB. GitHub's limit is 100 MB, so
-      # a file can sit happily on GitHub and still be refused here. Fail with the
-      # filename rather than letting the remote's pre-receive hook decline the push.
-      - name: Check no plain file exceeds the 10 MiB Space limit
+      # HuggingFace refuses two things outside LFS: any file over 10 MiB, and any
+      # binary file at all regardless of size. GitHub allows both (its limit is
+      # 100 MB and it does not care about binaries), so a file can sit happily on
+      # GitHub and still be refused here. Fail with the filename rather than letting
+      # the remote's pre-receive hook decline after the whole upload is attempted.
+      - name: Check nothing outside LFS violates the Space limits
         run: |
           set -euo pipefail
           limit=$((10 * 1024 * 1024))
           fail=0
           while IFS= read -r f; do
             [ -f "$f" ] || continue
+            git check-attr filter -- "$f" | grep -q 'filter: lfs' && continue
+
             sz=$(stat -c%s "$f")
-            [ "$sz" -le "$limit" ] && continue
-            if git check-attr filter -- "$f" | grep -q 'filter: lfs'; then
-              echo "  ok  $f ($((sz / 1048576)) MiB, LFS)"
-            else
-              echo "::error::$f is $((sz / 1048576)) MiB and not tracked by LFS."
-              echo "::error::Run: git lfs track \"$f\" && git add --renormalize \"$f\""
+            reason=""
+            [ "$sz" -gt "$limit" ] && reason="$((sz / 1048576)) MiB, over the 10 MiB limit"
+            # grep -I reports no match for a binary file; -s excludes empty files,
+            # which would otherwise look binary by the same test.
+            if [ -s "$f" ] && ! grep -qI . "$f" 2>/dev/null; then
+              reason="${reason:+$reason; }binary"
+            fi
+
+            if [ -n "$reason" ]; then
+              echo "::error::$f is not tracked by LFS ($reason)."
+              echo "::error::Fix: git lfs track \"$f\" && git add --renormalize \"$f\""
               fail=1
             fi
           done < <(git ls-files)
+          [ "$fail" -eq 0 ] && echo "  all non-LFS files are text and under 10 MiB"
           exit $fail
 
       - name: Build the deploy commit
