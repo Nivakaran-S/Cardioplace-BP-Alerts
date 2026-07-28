@@ -332,7 +332,20 @@ with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False) as demo:
 app = gr.mount_gradio_app(app, demo, path="/gradio")
 
 
+def _server_port() -> int:
+    """The port to bind.
+
+    A Gradio Space is always proxied on 7860 -- that is why app_port is a
+    Docker-only front-matter key. The Space also sets PORT to an internal value
+    (7861) that something else already holds, so honouring PORT there makes the
+    container exit with 'address already in use'. PORT is therefore only read
+    when not running on a Space.
+    """
+    if os.getenv("SPACE_ID"):
+        return int(os.getenv("GRADIO_SERVER_PORT", "7860"))
+    return int(os.getenv("PORT") or os.getenv("GRADIO_SERVER_PORT") or 7860)
+
+
 if __name__ == "__main__":
     import uvicorn
-    # 7860 is the port HuggingFace Spaces proxies; PORT overrides it elsewhere.
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))
+    uvicorn.run(app, host="0.0.0.0", port=_server_port())

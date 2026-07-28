@@ -6,6 +6,9 @@ colorTo: red
 sdk: gradio
 sdk_version: 5.36.2
 app_file: app.py
+# The Space defaults to Python 3.10, but the pinned numpy/scipy in
+# requirements.txt need >= 3.11. Without this the build cannot resolve them.
+python_version: "3.12"
 pinned: false
 short_description: BP forecasting, personalisation and early warning on HEMOBP
 ---

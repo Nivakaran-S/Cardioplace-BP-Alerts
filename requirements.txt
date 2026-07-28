@@ -1,10 +1,14 @@
 # --- pipeline ---
-numpy
-pandas
-scikit-learn
-scipy
+# Pinned to the versions that produced final_model/model.pkl. Unpinned, the Space
+# resolved scikit-learn 1.7.2 against a 1.8.0 pickle and sklearn warned that this
+# "might lead to breaking code or invalid results" -- not a risk worth carrying on
+# a clinical model. Re-pin these whenever the bundle is retrained.
+numpy==2.4.2
+pandas==2.3.3
+scikit-learn==1.8.0
+scipy==1.16.0
+joblib==1.5.3
 pyyaml
-joblib
 pyarrow
 python-dotenv
 
