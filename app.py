@@ -16,8 +16,7 @@ from typing import List, Optional
 import gradio as gr
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
@@ -74,8 +73,21 @@ app = FastAPI(
 )
 
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
-# CSS and JS live alongside the template, per the project layout.
-app.mount("/static", StaticFiles(directory=TEMPLATES_DIR), name="static")
+
+
+# CSS and JS live alongside the template, per the project layout. This is an
+# explicit route rather than app.mount(StaticFiles(...)) because a Mount cannot be
+# transplanted onto Gradio's app the way a plain route can -- see _serve_on_space.
+@app.get("/static/{filename}")
+def static_file(filename: str):
+    safe = os.path.basename(filename)          # no traversal out of templates/
+    path = os.path.join(TEMPLATES_DIR, safe)
+    if not os.path.isfile(path) or safe.endswith(".html"):
+        raise HTTPException(404, "not found")
+    media = {"css": "text/css", "js": "application/javascript",
+             "svg": "image/svg+xml", "ico": "image/x-icon"}.get(safe.rsplit(".", 1)[-1],
+                                                                "application/octet-stream")
+    return FileResponse(path, media_type=media)
 
 
 # ----------------------------------------------------------------- model loading
@@ -184,6 +196,12 @@ def _require_model() -> BPPredictor:
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(request: Request):
+    """Same dashboard, reachable when Gradio owns / (the Spaces layout)."""
     return templates.TemplateResponse("index.html", {"request": request})
 
 
@@ -362,6 +380,9 @@ with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False) as demo:
 
     g_btn.click(_gradio_predict, [g_readings, g_pid, g_age, g_sex, g_dm], [g_summary, g_json])
 
+# Off-Space (local run, Docker) FastAPI owns the server and Gradio is mounted under
+# it, which keeps the dashboard at /. On a Space that inversion is not available:
+# see _serve_on_space below.
 app = gr.mount_gradio_app(app, demo, path="/gradio")
 
 
@@ -379,6 +400,39 @@ def _server_port() -> int:
     return int(os.getenv("PORT") or os.getenv("GRADIO_SERVER_PORT") or 7860)
 
 
+def _serve_on_space(port: int) -> None:
+    """Let Gradio own the server, then graft the FastAPI routes onto its app.
+
+    A Space registers itself with the platform through Gradio's own launch path.
+    Running a custom uvicorn with Gradio merely mounted bypasses that, and on
+    ZeroGPU the supervisor then terminates the container shortly after startup --
+    the app serves correctly right up to the SIGTERM, which is what made this so
+    hard to read from the logs.
+
+    Gradio therefore owns "/" here, and the dashboard moves to /dashboard.
+    demo.app only exists once launch() has built it, so the routes are attached
+    afterwards; Starlette resolves routes per request, so late registration works.
+    """
+    STORE.load()   # the FastAPI lifespan does not run when Gradio owns the server
+    demo.launch(server_name="0.0.0.0", server_port=port,
+                prevent_thread_lock=True, share=False)
+
+    # Prepend, never append. Gradio's app ends in a catch-all that matches any
+    # unclaimed path, and Starlette stops at the first match -- appended routes
+    # are therefore unreachable and every one of them 404s.
+    ours = [r for r in app.routes
+            if getattr(r, "path", "").startswith(("/api", "/static", "/dashboard"))]
+    for route in reversed(ours):
+        demo.app.routes.insert(0, route)
+    logging.info("grafted %d FastAPI routes ahead of Gradio's catch-all "
+                 "(dashboard at /dashboard, API at /api/*)", len(ours))
+    demo.block_thread()
+
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=_server_port())
+    port = _server_port()
+    if os.getenv("SPACE_ID"):
+        _serve_on_space(port)
+    else:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=port)
