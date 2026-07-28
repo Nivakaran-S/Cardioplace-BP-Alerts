@@ -29,6 +29,32 @@ from src.utils.ml_utils.model.estimator import BPPredictor
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
+
+# ----------------------------------------------------- ZeroGPU compatibility
+# This pipeline is scikit-learn end to end and has no GPU path, so cpu-basic is
+# the right tier. A Space left on ZeroGPU, however, terminates at startup with
+# "No @spaces.GPU function detected" -- it treats a GPU Space with no GPU entry
+# point as a misconfiguration and refuses to serve.
+#
+# `spaces` is injected by HuggingFace only on a ZeroGPU Space, so its presence
+# is a reliable signal for that tier. Registering one trivial entry point there
+# satisfies the check and lets the app run on either tier unchanged. On
+# cpu-basic the import fails and nothing below happens.
+try:
+    import spaces as _spaces
+except Exception:
+    _spaces = None
+
+if _spaces is not None:
+    logging.info("ZeroGPU tier detected; registering a no-op GPU entry point. "
+                 "cpu-basic is the correct tier for this app -- nothing here uses a GPU.")
+
+    @_spaces.GPU(duration=1)
+    def _zerogpu_entrypoint():
+        """Exists only to satisfy ZeroGPU's startup probe. Never called by the app."""
+        return "cpu-only workload"
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     STORE.load()          # a missing model is a degraded state, never a failed boot
