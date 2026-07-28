@@ -67,9 +67,12 @@ in 1M-row chunks, and the run includes a forward-chained random search.
 ### How it is hosted
 
 The Space runs the **Gradio SDK**, which ignores the `Dockerfile` and simply executes
-`app.py`. Gradio is therefore mounted onto the FastAPI app rather than the other way
-round, so one uvicorn process serves the dashboard, the REST API and the Gradio
-interface together. The `Dockerfile` is kept for running the same app anywhere else.
+`app.py`. Locally that means FastAPI owns the server and Gradio is mounted at
+`/gradio`; on a Space it is the other way round, because the SDK may *import* the
+module and launch `demo` itself rather than run it as `__main__`. The dashboard is
+therefore built into the Gradio Blocks and rendered server-side — no `/static` fetch,
+no `/api` call — so it stands up under either entry point. The `Dockerfile` is kept
+for running the same app anywhere else.
 
 ### Hardware
 
@@ -91,7 +94,8 @@ Gradio events and are unaffected.
 
 ```bash
 curl -X POST localhost:7860/api/predict -H "Content-Type: application/json" -d '{
-  "patient_id": "demo", "age": 68, "is_male": 1, "is_dm": 0,
+  "patient_id": "demo",
+  "profile": {"age": 68, "is_male": 1, "is_dm": 0},
   "readings": [{"ts": "2026-01-05", "sbp": 152, "dbp": 78}]
 }'
 ```

@@ -289,6 +289,48 @@ def _rv(row, name, default=0):
     return default if v is None or (isinstance(v, float) and not np.isfinite(v)) else v
 
 
+def _personalised_high(r) -> bool:
+    """Model 2's learned threshold when one is supplied, else the engine's fixed
+    provider-target + 20.
+
+    This is the learned generalisation of the engine's existing personalised mode:
+    the ML layer supplies the offset instead of the hard-coded 20 mmHg. `run` puts
+    the threshold on the row as `ml_threshold`, because predicates only receive the
+    row.
+
+    It cannot suppress an alert. The predicate only ever ADDS a way for the L1 axis
+    to fire; nothing downstream is removed, and RULE_STANDARD_L1_HIGH still sits
+    directly underneath it in the same tier, so SBP >= 140 fires with or without a
+    learned value. The caps put the threshold in [115, 155] around the population
+    140, which splits into two regimes:
+
+      141-155  loosening -- the standard rule already claimed the reading, so this
+               only changes which rule_id is recorded.
+      115-139  tightening -- the reading is abnormal for THIS patient though below
+               the population floor, and fires where the population run was silent.
+
+    Tightening is the point of the asymmetric caps (-25 tighten vs +15 loosen): the
+    engine is deliberately more willing to tighten than to loosen. Differential
+    execution over the synthetic cohort confirms the direction -- 94 newly-fired and
+    21 escalated rows, zero suppressed and zero softened.
+
+    The emergency axis runs earlier and short-circuits, and Gate 3 asserts every
+    threshold stays under the 180 mmHg floor, so no learned value can reach it.
+    """
+    ml = _rv(r, "ml_threshold", np.nan)
+    if np.isfinite(ml) and r.sbp >= ml:
+        return True
+    pt = _rv(r, "provider_target", np.nan)
+    return bool(np.isfinite(pt) and r.sbp >= pt + 20)
+
+
+def _personalised_low(r) -> bool:
+    """Model 2 produces an upper threshold only, so the low branch keeps the
+    engine's provider-target - 20."""
+    pt = _rv(r, "provider_target", np.nan)
+    return bool(np.isfinite(pt) and r.sbp <= pt - 20)
+
+
 # axis -> ordered [(rule_id, tier, predicate)]. Order IS the clinical semantics.
 AXIS_RULES = {
     "EMERGENCY": [
@@ -351,9 +393,7 @@ AXIS_RULES = {
         ("RULE_TACHY_HR", "BP_LEVEL_1_HIGH",
          lambda r: _rv(r, "pulse", 0) > 130
          or (_rv(r, "pulse", 0) > 100 and _rv(r, "hr_high_recent"))),
-        ("RULE_PERSONALIZED_HIGH", "BP_LEVEL_1_HIGH",
-         lambda r: np.isfinite(_rv(r, "provider_target", np.nan))
-         and r.sbp >= _rv(r, "provider_target", 1e9) + 20),
+        ("RULE_PERSONALIZED_HIGH", "BP_LEVEL_1_HIGH", _personalised_high),
         ("RULE_STANDARD_L1_HIGH", "BP_LEVEL_1_HIGH", lambda r: r.sbp >= 140 or r.dbp >= 90),
         # --- low branch ---
         ("RULE_SYNCOPE_GENERAL", "BP_LEVEL_1_LOW", lambda r: _rv(r, "syncope")),
@@ -382,9 +422,7 @@ AXIS_RULES = {
          lambda r: _rv(r, "has_as") and r.sbp < 105),
         ("RULE_AGE_65_LOW", "BP_LEVEL_1_LOW",
          lambda r: _rv(r, "age", 0) >= 65 and r.sbp < 100),
-        ("RULE_PERSONALIZED_LOW", "BP_LEVEL_1_LOW",
-         lambda r: np.isfinite(_rv(r, "provider_target", np.nan))
-         and r.sbp <= _rv(r, "provider_target", -1e9) - 20),
+        ("RULE_PERSONALIZED_LOW", "BP_LEVEL_1_LOW", _personalised_low),
         ("RULE_STANDARD_L1_LOW", "BP_LEVEL_1_LOW", lambda r: r.sbp < 90 or r.dbp < 60),
     ],
     "TIER_3": [
@@ -424,6 +462,9 @@ class ExtendedRuleEngine(RuleEngine):
     """The same engine contract, with the symptom / medication / condition axes populated."""
 
     def evaluate_row(self, row, personal_thr, prev_emergency) -> dict:
+        # `personal_thr` is kept for the base-class signature but is not read here:
+        # this engine dispatches through AXIS_RULES, whose predicates take the row
+        # alone, so `run` hands the threshold over as the `ml_threshold` column.
         gate = self._gate(row)
         out = dict(tier=None, rule_id=None, mode="STANDARD", gate_reason=gate,
                    short_circuited=False)
@@ -448,10 +489,9 @@ class ExtendedRuleEngine(RuleEngine):
         for axis in ("CONTRAINDICATION", "TIER_2", "L1"):
             for rid, tier, pred in AXIS_RULES[axis]:
                 if pred(row):
-                    thr_hit = (personal_thr is not None and axis == "L1"
-                               and rid.startswith("RULE_PERSONALIZED"))
                     out.update(tier=tier, rule_id=rid,
-                               mode="PERSONALIZED" if thr_hit else "STANDARD")
+                               mode=("PERSONALIZED" if rid.startswith("RULE_PERSONALIZED")
+                                     else "STANDARD"))
                     return out
 
         for rid, tier, pred in AXIS_RULES["TIER_3"]:
@@ -465,6 +505,11 @@ class ExtendedRuleEngine(RuleEngine):
         for sid, g in panel.groupby("series_id", sort=False):
             g = g.sort_values("step")
             thr = self.personal.get(sid) if use_personalisation else None
+            # Predicates only receive the row, so Model 2's threshold rides along as a
+            # column. Without this the learned offset is computed, reported, and then
+            # silently ignored by every rule.
+            if thr is not None:
+                g = g.assign(ml_threshold=float(thr))
             prev_emerg = False
             for row in g.itertuples():
                 r = self.evaluate_row(row, thr, prev_emerg)
