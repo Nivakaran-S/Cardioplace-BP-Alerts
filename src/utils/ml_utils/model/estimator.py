@@ -396,8 +396,13 @@ class BPPredictor:
                 # dropped here instead of being serialised into the advisory.
                 if not np.isfinite(p):
                     continue
+                # h is the target shift; the reading being predicted is h+1 readings after
+                # the last one observed, because the features at the placeholder row see
+                # only up to the newest actual reading. Reporting h here understated every
+                # horizon by one gap -- "in ~2 days" for a ~4-day forecast.
                 out["forecast"].setdefault(sig, {})[f"h{h}"] = dict(
-                    point=round(p, 1), steps_ahead=h, days_ahead_est=round(h * med_gap, 1))
+                    point=round(p, 1), readings_ahead=h + 1, steps_ahead=h + 1,
+                    days_ahead_est=round((h + 1) * med_gap, 1))
 
             iv = b["interval"]
             node = out["forecast"].get(iv["signal"], {}).get(f"h{iv['horizon']}")

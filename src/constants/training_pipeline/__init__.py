@@ -96,8 +96,18 @@ DATA_TRANSFORMATION_FEATURE_LIST_FILE_NAME: str = "feature_names.yaml"
 DATA_TRANSFORMATION_FEATURE_DICT_FILE_NAME: str = "feature_dictionary.csv"
 DATA_TRANSFORMATION_LEAKAGE_REPORT_FILE_NAME: str = "leakage_audit.csv"
 
-# Causal feature construction
-HORIZONS: tuple = (1, 2, 3)  # sessions ahead (~2, 5, 7 days at 3x/week)
+# Causal feature construction.
+#
+# `h` is the shift applied to the target: y_<signal>_h<h>[t] = signal[t+h], paired with
+# features at t, which read only <= t-1. So the last reading the model sees is t-1 and the
+# reading it predicts is t+h -- h+1 readings later, not h. At serving the placeholder row
+# occupies slot t, which is the patient's NEXT reading, so h=0 is that next reading.
+#
+# This used to be (1, 2, 3) with everything labelled "h sessions ahead", which put every
+# forecast one reading further out than advertised: h1 was presented as ~2 days when it was
+# ~4. The set now starts at 0 so the shortest horizon really is the next reading, and
+# `steps_ahead`/`days_ahead_est` report h+1 rather than h.
+HORIZONS: tuple = (0, 1, 2)  # -> 1, 2, 3 readings ahead (~2, 5, 7 days at 3x/week)
 LAGS: tuple = (1, 2, 3, 5, 7, 14)
 WINDOWS: tuple = (3, 7, 14, 30)
 SIGNALS: tuple = ("sbp", "dbp", "idwg")

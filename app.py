@@ -388,7 +388,8 @@ def _backtest(predictor: BPPredictor, F: pd.DataFrame, signal: str = "sbp") -> d
             continue
         out["series"][f"h{h}"] = rows
         out["horizons"].append({
-            "horizon": h, "days_ahead": round(h * med_gap, 1), "n": len(rows),
+            "horizon": h, "readings_ahead": h + 1,
+            "days_ahead": round((h + 1) * med_gap, 1), "n": len(rows),
             "mae": round(float(np.mean(errs)), 2),
             "within_10": round(float(np.mean([e <= 10 for e in errs])), 3),
         })
@@ -936,7 +937,7 @@ def _render_dashboard(a: dict) -> str:
             cc = "crit" if x.get("is_emergency") else ("warn" if x.get("fired") else "good")
             h.append(
                 f'<div class="card"><p class="lbl">in ~{_esc(x["days_ahead"])} days '
-                f'· +{_esc(x["steps_ahead"])} sessions</p>'
+                f'· {_esc(x["steps_ahead"])} reading(s) ahead</p>'
                 f'<p class="val">{_esc(x["sbp"])}'
                 + (f'/{_esc(x["dbp"])}' if x.get("dbp") is not None else "")
                 + '<span class="u">mmHg</span></p>'
@@ -995,7 +996,7 @@ def _render_dashboard(a: dict) -> str:
         xl = [(0, hist[0]["ts"][5:]), (len(hist) // 2, hist[len(hist) // 2]["ts"][5:]),
               (len(hist) - 1, hist[-1]["ts"][5:])]
         if fpts:
-            xl.append((n - 1, f"+{fpts[-1]['steps_ahead']} sess"))
+            xl.append((n - 1, f"+{fpts[-1]['steps_ahead']} rdg"))
         refs = [(pers.get("threshold"), S["warning"],
                  f"threshold {pers.get('threshold')}"),
                 (a.get("emergency_floor_mmHg"), S["critical"],
@@ -1022,7 +1023,7 @@ def _render_dashboard(a: dict) -> str:
                       f"{abs(f['point'] - thr):.1f} "
                       f"{'over' if f['point'] >= thr else 'under'}") if thr else "–"
                 band = (f"{f['lo80']} – {f['hi80']}" if f.get("lo80") is not None else "–")
-                h.append(f"<tr><td>+{f['steps_ahead']} sessions</td><td>{f['point']}</td>"
+                h.append(f"<tr><td>{f['steps_ahead']} reading(s)</td><td>{f['point']}</td>"
                          f"<td>{band}</td><td>{f['days_ahead_est']}</td>"
                          f"<td>{_esc(dl)}</td></tr>")
             h.append("</tbody></table>")
@@ -1037,8 +1038,9 @@ def _render_dashboard(a: dict) -> str:
             xl = [(0, rows[0]["ts"][5:]), (len(rows) // 2, rows[len(rows) // 2]["ts"][5:]),
                   (len(rows) - 1, rows[-1]["ts"][5:])]
             h.append('<div class="pnl"><h3>What we predicted, against what happened</h3>'
-                     f'<p class="hint">Each point is the forecast made {hh["horizon"]} '
-                     f'session(s) — about {hh["days_ahead"]} days — before that reading. '
+                     f'<p class="hint">Each point is the forecast made '
+                     f'{hh.get("readings_ahead", hh["horizon"] + 1)} reading(s) — about '
+                     f'{hh["days_ahead"]} days — before that reading. '
                      "The features behind it never saw the day they predict.</p>"
                      + _legend([(C["s1"], "Actual"),
                                 (C["s2"], f"Predicted {hh['days_ahead']} days earlier")])
@@ -1049,7 +1051,8 @@ def _render_dashboard(a: dict) -> str:
                      + "</div><table><thead><tr><th>Horizon</th><th>Days ahead</th>"
                      "<th>n</th><th>MAE (mmHg)</th><th>within 10</th></tr></thead><tbody>")
             for x in bt["horizons"]:
-                h.append(f"<tr><td>+{x['horizon']} sessions</td><td>{x['days_ahead']}</td>"
+                h.append(f"<tr><td>{x.get('readings_ahead', x['horizon'] + 1)} reading(s)"
+                         f"</td><td>{x['days_ahead']}</td>"
                          f"<td>{x['n']}</td><td>{x['mae']}</td>"
                          f"<td>{round(x['within_10'] * 100)}%</td></tr>")
             h.append("</tbody></table></div>")
@@ -1244,7 +1247,10 @@ with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False,
             g_readings = gr.Textbox(
                 label="Session history", lines=10,
                 info="One per line: date, SBP, DBP[, pulse, weight]",
-                value=_sample_readings())
+                # Callable, not a call: Gradio re-evaluates it on every page load, so the
+                # sample cannot age past the staleness limit on a Space that has been up
+                # for weeks. Calling it here would freeze the dates at import time.
+                value=_sample_readings)
             gr.Markdown("### Today's symptoms  \n"
                         "<small>applied to the most recent reading — these are what "
                         "unlock the symptom-gated rules</small>")
