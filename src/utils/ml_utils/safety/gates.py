@@ -10,6 +10,7 @@ import pandas as pd
 
 from src.logging.logger import logging
 from src.utils.ml_utils.rule_engine.advisory import OVERRIDE_SCHEMA
+from src.utils.ml_utils.safety.missingness import missingness_gate
 
 
 class AbstentionPolicy:
@@ -68,7 +69,8 @@ class SafetyGates:
 def run_safety_gates(alerts_pop: pd.DataFrame, alerts_pers: pd.DataFrame,
                      offsets: pd.DataFrame, advisories: list, cold_start: pd.DataFrame,
                      fairness: pd.DataFrame, explanation: dict, abstention: AbstentionPolicy,
-                     test_ood_rates: float, config) -> SafetyGates:
+                     test_ood_rates: float, config,
+                     missingness: pd.DataFrame = None) -> SafetyGates:
     """Execute all nine gates and return the collector."""
     g = SafetyGates()
     key = ["series_id", "step"]
@@ -132,6 +134,17 @@ def run_safety_gates(alerts_pop: pd.DataFrame, alerts_pers: pd.DataFrame,
     g.gate(9, "override captured as a distinct schema, not folded into dispositions",
            "rationale" in OVERRIDE_SCHEMA,
            "schema defined; UI + persistence are product work", critical=False)
+
+    # -- Gate 10: the forecaster survives users skipping readings --------------------
+    # Non-critical for now, and the reason is worth stating: the ship decision currently
+    # sends a baseline to production, and a baseline's lift over persistence is structurally
+    # small, so making this blocking today would fail promotion on a property the incumbent
+    # already has. Promote it to critical the first time a learned model wins the ship
+    # decision -- that is the point at which "it degrades gracefully" stops being free.
+    if missingness is not None:
+        ok, detail = missingness_gate(missingness)
+        g.gate(10, "the shipped forecaster still beats persistence under deleted sessions",
+               ok, detail, critical=False)
 
     frame = g.frame()
     logging.info("%d/%d gates pass | %d critical failures | promotable=%s",

@@ -36,7 +36,24 @@ class RuleEngine:
 
     # ---- gates --------------------------------------------------------------
     def _gate(self, row) -> str:
-        if row.days_since_last > self.STALE_GAP_DAYS:
+        """`HISTORICAL_ENTRY` must mean "this reading is old", not "the one before it was".
+
+        `days_since_last` is the spacing to the PREVIOUS reading. Gating on it inverted the
+        policy: a patient who logs SBP 200 today after a three-week absence has a gap of 21,
+        so the reading was classified historical and `_stage_emergency` was skipped -- the
+        emergency was suppressed precisely for the user most likely to need it.
+
+        The policy is unchanged: a genuinely back-dated entry must not fire a live L2, and
+        is excluded from the CMS 99454 count. Only the variable that detects it is corrected.
+        `reading_age_days` is the age of the reading at the moment of evaluation, which the
+        serving path supplies from `as_of`. The training panel has no such column, so the
+        fallback keeps offline behaviour bit-identical -- proved by differential execution.
+        """
+        age = getattr(row, "reading_age_days", None)
+        if age is not None and np.isfinite(age):
+            if age > self.STALE_GAP_DAYS:
+                return "HISTORICAL_ENTRY"
+        elif row.days_since_last > self.STALE_GAP_DAYS:
             return "HISTORICAL_ENTRY"
         if getattr(row, "n_meas", 99) < 2:
             return "SINGLE_READING_NON_EMERGENCY"

@@ -252,6 +252,29 @@ class DriftMonitor:
                     status="ALARM" if rel > self.RATE_ALARM_REL else "ok",
                     needs_labels=False, detectable_within="days")
 
+    def cadence_drift(self, ref_gap, cur_gap) -> dict:
+        """PSI on the RAW gap, as its own signal rather than one row of feature_drift.
+
+        Two reasons it cannot ride along with `feature_drift`: that method returns only the
+        top 20 features by PSI, so cadence drops off the report exactly when other features
+        are moving; and it reads `days_since_last`, which is clipped, so a cohort drifting
+        from 30-day to 200-day gaps registers as no change at all.
+
+        This is the signal that fires when a product built for daily journaling starts
+        seeing the irregular, long gaps a dialysis corpus never contained.
+        """
+        r = pd.Series(ref_gap).replace([np.inf, -np.inf], np.nan).dropna()
+        c = pd.Series(cur_gap).replace([np.inf, -np.inf], np.nan).dropna()
+        psi = population_stability_index(r.values, c.values) if len(r) and len(c) else np.nan
+        status = ("ALARM" if np.isfinite(psi) and psi >= self.PSI_ALARM
+                  else "WARN" if np.isfinite(psi) and psi >= self.PSI_WARN else "ok")
+        return dict(signal="session cadence",
+                    reference=round(float(r.median()), 2) if len(r) else np.nan,
+                    current=round(float(c.median()), 2) if len(c) else np.nan,
+                    relative_change=round(float(psi), 3) if np.isfinite(psi) else np.nan,
+                    status=status, needs_labels=False,
+                    detectable_within="days (median gap, PSI on the unclipped value)")
+
     @staticmethod
     def response_ladder(status: str) -> str:
         if status != "ALARM":

@@ -42,6 +42,7 @@ from src.utils.ml_utils.rule_engine.synthetic import (ExtendedRuleEngine,
                                                       synth_param_table)
 from src.utils.ml_utils.safety.gates import (AbstentionPolicy, cold_start_curve,
                                              provenance_guard, run_safety_gates)
+from src.utils.ml_utils.safety.missingness import missingness_sweep
 
 import mlflow
 from urllib.parse import urlparse
@@ -72,31 +73,208 @@ class ModelTrainer:
         except Exception as e:
             raise CustomException(e, sys)
 
-    def track_mlflow(self, best_model, metrics: dict, tag: str = "forecast"):
+    @staticmethod
+    def _mlflow_ready() -> bool:
         # Registry follows tracking. Hardcoding it lets the two drift onto different
         # DagsHub repos, so runs land in one project and registered models in another.
         _registry = os.getenv("MLFLOW_TRACKING_URI")
         if _registry:
             mlflow.set_registry_uri(_registry)
-        tracking_url_type_store = urlparse(mlflow.get_tracking_uri()).scheme
+        return urlparse(mlflow.get_tracking_uri()).scheme != "file"
+
+    @staticmethod
+    def _clean_metrics(metrics: dict, prefix: str = "") -> dict:
+        """Finite floats only, under names MLflow accepts."""
+        out = {}
+        for k, v in (metrics or {}).items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(fv):
+                continue
+            name = f"{prefix}{k}".replace("%", "pct").replace("(", "").replace(")", "")
+            name = "".join(c if (c.isalnum() or c in "_-./ ") else "_" for c in name)
+            out[name] = fv
+        return out
+
+    def track_mlflow(self, best_model, metrics: dict, tag: str = "forecast"):
         try:
             with mlflow.start_run(nested=True):
                 mlflow.set_tag("stage", tag)
-                for k, v in metrics.items():
-                    if v is None:
-                        continue
-                    try:
-                        fv = float(v)
-                    except (TypeError, ValueError):
-                        continue
-                    if np.isfinite(fv):
-                        mlflow.log_metric(k, fv)
-                if best_model is not None and tracking_url_type_store != "file":
+                for k, v in self._clean_metrics(metrics).items():
+                    mlflow.log_metric(k, v)
+                if best_model is not None and self._mlflow_ready():
                     mlflow.sklearn.log_model(best_model, "model")
         except Exception as exc:
             # Tracking is observability, not a training dependency. A missing DagsHub
             # credential must not lose a completed run.
             logging.warning("mlflow tracking skipped (%s): %s", tag, exc)
+
+    def _log_candidate(self, name: str, category: str, selection: str,
+                       tags: dict, metrics: dict, params: dict = None,
+                       model=None, registered_name: str = None) -> bool:
+        """One MLflow run for one trained model.
+
+        `selection` is the point of this: every candidate the pipeline fitted is recorded,
+        and the one that actually serves is tagged `final`. Logging only the winner made
+        the tracking store agree with itself no matter what was selected -- there was no
+        way to see what a choice was made against, which is most of what a run is for.
+        """
+        if selection != "final" and os.getenv("MLFLOW_LOG_CANDIDATES", "1").strip().lower() \
+                in {"0", "false", "no", "off"}:
+            return False
+        try:
+            with mlflow.start_run(run_name=name, nested=True):
+                mlflow.set_tag("category", category)
+                mlflow.set_tag("selection", selection)         # final | candidate
+                mlflow.set_tag("is_final", str(selection == "final").lower())
+                for k, v in (tags or {}).items():
+                    if v is not None:
+                        mlflow.set_tag(k, str(v))
+                for k, v in (params or {}).items():
+                    if v is not None:
+                        mlflow.log_param(k, v)
+                for k, v in self._clean_metrics(metrics).items():
+                    mlflow.log_metric(k, v)
+                # Only finals carry a serialised estimator: logging every candidate would
+                # multiply artifact storage by ~100 for models nothing will ever load.
+                if model is not None and selection == "final" and self._mlflow_ready():
+                    try:
+                        mlflow.sklearn.log_model(model, "model",
+                                                 registered_model_name=registered_name)
+                    except Exception as exc:
+                        logging.warning("mlflow model artifact skipped for %s: %s", name, exc)
+            return True
+        except Exception as exc:
+            logging.warning("mlflow candidate run skipped (%s): %s", name, exc)
+            return False
+
+    def track_model_catalogue(self, config, R, shipped, off_report, offset_search,
+                              offset_model, det_report, det_report_val, det_name,
+                              tier_metrics_df, predictor) -> int:
+        """Log every model this run fitted, with the shipped ones tagged `final`.
+
+        Four categories are trained and selected from -- forecasters, the personalisation
+        offset, early-warning detectors and the classifier heads -- and previously exactly
+        one headline run reached MLflow. Each candidate now gets its own nested run so the
+        selection is auditable from the tracking store alone.
+        """
+        # Every candidate is one HTTP round trip to the tracking server -- on this cohort
+        # that is ~136 runs, which is fine locally and noticeable against a remote DagsHub.
+        # `MLFLOW_LOG_CANDIDATES=0` keeps the finals and drops the rest, so the switch can
+        # be thrown on a deployed Space without editing code.
+        finals_only = os.getenv("MLFLOW_LOG_CANDIDATES", "1").strip().lower() in {
+            "0", "false", "no", "off"}
+        if finals_only:
+            logging.info("mlflow: MLFLOW_LOG_CANDIDATES is off -- logging shipped models "
+                         "only, not the candidates they were selected against")
+
+        n = 0
+        run_tags = dict(run_id=config.run_id, model_version=f"hemobp-bp-{config.run_id}")
+
+        # ---- Model 1: forecasters (learned kinds and baselines, per signal x horizon) ----
+        if R is not None and len(R):
+            keys = ["family", "signal", "model", "horizon"]
+            for (family, signal, model_name, h), grp in R.groupby(keys, dropna=False):
+                metrics = {}
+                for split, sg in grp.groupby("split"):
+                    row = sg.iloc[0]
+                    metrics.update(self._clean_metrics(
+                        {k: row.get(k) for k in ("MAE", "MAE_lo", "MAE_hi", "RMSE", "R2",
+                                                 "bias", "DirAcc", "target_sd", "n")},
+                        prefix=f"{split}_"))
+                ship_family, ship_name = shipped.get(signal, (None, None))
+                is_final = family == ship_family and model_name == ship_name
+                n += self._log_candidate(
+                    name=f"forecaster/{signal}/h{int(h)}/{model_name}",
+                    category="forecaster", selection="final" if is_final else "candidate",
+                    tags=dict(signal=signal, horizon=int(h), family=family,
+                              model=model_name, **run_tags),
+                    metrics=metrics,
+                    params=dict(**self.best_params.get((model_name, signal), {}),
+                                horizon=int(h)),
+                    model=(predictor.b["forecasters"].get((signal, int(h)))
+                           if is_final else None),
+                    registered_name=f"hemobp-forecaster-{signal}-h{int(h)}")
+
+        # ---- Model 2: the offset, plus every warm/k/q the search fitted ----------------
+        if off_report is not None and len(off_report):
+            for model_name, grp in off_report.groupby("model"):
+                metrics = {}
+                for _, row in grp.iterrows():
+                    p = str(row["split"]).replace(" ", "_").replace("-", "_")
+                    metrics.update(self._clean_metrics(
+                        {k: row.get(k) for k in ("MAE", "lo", "hi", "R2", "within_10mmHg")},
+                        prefix=f"{p}_"))
+                is_final = model_name == "learned (capped blend)"
+                n += self._log_candidate(
+                    name=f"offset/{model_name}", category="offset",
+                    selection="final" if is_final else "candidate",
+                    tags=dict(model=model_name, **run_tags), metrics=metrics,
+                    params=(dict(warm=offset_model.warm, k=offset_model.k, q=offset_model.q)
+                            if is_final else None),
+                    registered_name="hemobp-offset")
+        if offset_search is not None and len(offset_search):
+            for i, row in offset_search.reset_index(drop=True).iterrows():
+                sel = ("final" if (int(row.warm) == int(offset_model.warm)
+                                   and float(row.k) == float(offset_model.k)
+                                   and float(row.q) == float(offset_model.q))
+                       else "candidate")
+                n += self._log_candidate(
+                    name=f"offset-search/warm{int(row.warm)}-k{row.k:g}-q{row.q:g}",
+                    category="offset-search", selection=sel,
+                    tags=dict(**run_tags),
+                    metrics=self._clean_metrics({"mae_fit": row.mae_fit, "n": row.n}),
+                    params=dict(warm=int(row.warm), k=float(row.k), q=float(row.q)))
+
+        # ---- Model 3: every detector scored, at the configured alert budget -------------
+        for label, rep in (("val", det_report_val), ("test", det_report)):
+            if rep is None or not len(rep):
+                continue
+            at = rep[rep.budget_pct == config.alert_budget_pct]
+            for _, row in at.iterrows():
+                if label == "test":
+                    continue        # metrics merged into the val run below
+                t = rep[rep.budget_pct == config.alert_budget_pct]
+                te = (det_report[(det_report.budget_pct == config.alert_budget_pct)
+                                 & (det_report.detector == row.detector)]
+                      if det_report is not None and len(det_report) else None)
+                metrics = self._clean_metrics(
+                    {k: row.get(k) for k in ("precision", "recall", "lift", "auc_roc",
+                                             "auc_pr", "auc_pr_lift", "base_rate",
+                                             "lead_days_median", "alerts_per_patient_week")},
+                    prefix="val_")
+                if te is not None and len(te):
+                    metrics.update(self._clean_metrics(
+                        {k: te.iloc[0].get(k) for k in
+                         ("precision", "recall", "lift", "auc_roc", "auc_pr",
+                          "auc_pr_lift", "lead_days_median", "alerts_per_patient_week")},
+                        prefix="test_"))
+                is_final = row.detector == det_name
+                n += self._log_candidate(
+                    name=f"detector/{row.detector}", category="detector",
+                    selection="final" if is_final else "candidate",
+                    tags=dict(detector=row.detector, family=row.get("family"), **run_tags),
+                    metrics=metrics,
+                    params=dict(budget_pct=config.alert_budget_pct,
+                                warn_window=config.warn_window,
+                                event_quantile=config.event_quantile),
+                    registered_name="hemobp-detector")
+
+        # ---- classifier heads -----------------------------------------------------------
+        if tier_metrics_df is not None and len(tier_metrics_df):
+            for _, row in tier_metrics_df.iterrows():
+                d = row.to_dict()
+                tier = d.pop("tier", "?")
+                n += self._log_candidate(
+                    name=f"classifier/tier-head/{tier}", category="classifier",
+                    selection="final", tags=dict(tier=tier, **run_tags),
+                    metrics=self._clean_metrics(d))
+
+        logging.info("mlflow: logged %d model runs (forecasters, offset, detectors, heads); "
+                     "shipped ones tagged selection=final", n)
+        return n
 
     # ------------------------------------------------------------------ forecaster
     def train_forecasters(self, F, features, config):
@@ -260,17 +438,23 @@ class ModelTrainer:
                 logging.info("offset decision -> %s (gain %+.2f mmHg vs %s, CI width %.2f)",
                              verdict, gain, alt_name, ci_w)
                 # Unlike the forecaster, the blend is NOT auto-replaced on a BASELINE
-                # verdict. Once the governance caps are applied to every candidate the
-                # alternatives collapse to constants -- capped cohort-only is 155 mmHg
-                # for every patient -- so acting on the verdict would delete
-                # personalisation rather than simplify it. The blend is the best point
-                # estimate and the only candidate that varies per patient; the verdict
-                # is recorded here as "not proven better", which is what it means.
+                # verdict, because on this target the alternatives are not a simpler way
+                # to do the same job:
+                #   cohort-only  collapses to a constant under the caps (its 160-174
+                #                band clips to 155 for every patient), which is not
+                #                personalisation at all.
+                #   personal-only does vary, but it has no shrinkage, so a patient with
+                #                five readings gets a threshold set by five readings --
+                #                the failure the blend's n/(n+k) weight exists to stop.
+                # The separation is also inside the noise: the held-out spread is under
+                # half a mmHg against a bootstrap CI several mmHg wide, and the blend is
+                # ahead on the larger all-patients sample. "BASELINE" here means "not
+                # proven better", and that is what gets recorded.
                 if verdict != "learned model":
-                    logging.info("offset retained: alternatives are constants under the "
-                                 "caps (%s = one threshold for every patient), so the "
-                                 "verdict records 'not proven better', not 'replace'",
-                                 alt_name)
+                    logging.info("offset retained: %s wins by %.2f mmHg on %d held-out "
+                                 "patients against a CI %.2f wide -- inside the noise, "
+                                 "and it carries no shrinkage for short histories",
+                                 alt_name, -gain, len(M_hold), ci_w)
                 offset_artifact = OffsetMetricArtifact(
                     label="capped shrinkage blend", warm=offset_model.warm,
                     k=offset_model.k, q=offset_model.q, n_patients=len(M_hold),
@@ -425,7 +609,12 @@ class ModelTrainer:
             train_medians = F[F.split == "train"][features].median()
             fc_model = (list(reloaded.b["forecasters"].values())[0]
                         if reloaded.b["forecasters"] else None)
-            explanation = (explain_prediction(fc_model, row_x, features[:12], train_medians)
+            # Perturb every feature, not an arbitrary first-N slice. The slice happened to
+            # contain the lags an HGB leans on; a shipped EWMA baseline reads one column
+            # (sbp_ewm0.3) that fell outside it, so every perturbation was a no-op and the
+            # explanation came back all zeros -- which gate 6 correctly refused to promote.
+            # explain_prediction already returns only the top N by absolute contribution.
+            explanation = (explain_prediction(fc_model, row_x, features, train_medians)
                            if fc_model is not None else {})
 
             ood_cols = [c for c in features if F[c].notna().mean() > .8][:25]
@@ -458,9 +647,24 @@ class ModelTrainer:
                 raise AssertionError("provenance guard failed: synthetic rows reached the "
                                      "real-data record")
 
+            # ---- 12b. missingness robustness ---------------------------------------
+            # The pipeline never imputes a skipped session, which is correct; this is the
+            # evidence that the choice survives contact with users who skip them.
+            miss = pd.DataFrame()
+            try:
+                with timer("missingness sweep"):
+                    miss = missingness_sweep(panel, features, config, shipped,
+                                             self.best_params)
+                if len(miss):
+                    save_report(config.report_path("missingness_robustness.csv"), miss)
+                    logging.info("missingness sweep:\n%s", miss.to_string(index=False))
+            except Exception as exc:
+                logging.warning("missingness sweep unavailable: %s", exc)
+
             # ---- 13. safety gates --------------------------------------------------
             gates = run_safety_gates(alerts_pop, alerts_pers, OFF, advisories, cold,
-                                     fairness, explanation, abstain, ood_rate, config)
+                                     fairness, explanation, abstain, ood_rate, config,
+                                     missingness=miss)
             save_report(config.report_path("safety_gates.csv"), gates.frame())
             gate_artifact = SafetyGateArtifact(
                 gate_report_file_path=config.report_path("safety_gates.csv"),
@@ -477,11 +681,28 @@ class ModelTrainer:
                 save_report(config.report_path("champion_challenger.csv"), chall)
 
             # ---- 15. persist the model and track ------------------------------------
+            # The run always keeps its own artifact: a blocked run still has to be
+            # inspectable, and this path is inside Artifacts/<run>, which nothing serves.
             model_dir_path = os.path.dirname(config.trained_model_file_path)
             os.makedirs(model_dir_path, exist_ok=True)
             save_object(config.trained_model_file_path, predictor)
-            # model pusher
-            save_object(os.path.join(config.final_model_dir, "model.pkl"), predictor)
+
+            # The push to final_model/ is the actual promotion: that file is what the API
+            # loads and what the deploy workflow ships. It is gated on `promotable`, which
+            # until now was computed, logged as "PROMOTION BLOCKED", and then ignored --
+            # the push happened above the check, so a model that failed a critical safety
+            # gate reached production anyway and the previous good model was overwritten.
+            final_path = os.path.join(config.final_model_dir, "model.pkl")
+            if gates.promotable:
+                save_object(final_path, predictor)
+                logging.info("promoted to %s (%d/%d gates pass, 0 critical failures)",
+                             final_path, gate_artifact.gates_passed,
+                             gate_artifact.gates_total)
+            else:
+                logging.error("PROMOTION BLOCKED: %d critical safety-gate failures -- %s "
+                              "left untouched, the run's own artifact is at %s",
+                              gate_artifact.critical_failures, final_path,
+                              config.trained_model_file_path)
 
             test_rows = R[(R.split == "test") & (R.family == "learned")]
             val_rows = R[(R.split == "val") & (R.family == "learned")]
@@ -501,11 +722,28 @@ class ModelTrainer:
                 headline["offset_mae"] = offset_artifact.mae
             headline["gates_passed"] = gate_artifact.gates_passed
             headline["critical_gate_failures"] = gate_artifact.critical_failures
-            self.track_mlflow(fc_model, headline, tag="hemobp-bp")
+            headline["promotable"] = int(gates.promotable)
 
-            if not gates.promotable:
-                logging.error("PROMOTION BLOCKED: %d critical safety-gate failures",
-                              gate_artifact.critical_failures)
+            # One parent run per pipeline run, with a child run for every model fitted.
+            # The parent carries the headline and the governance outcome; the children make
+            # the selection auditable -- previously only the winner was logged, so the
+            # tracking store could not show what it had won against.
+            try:
+                self._mlflow_ready()
+                with mlflow.start_run(run_name=f"hemobp-bp-{config.run_id}"):
+                    mlflow.set_tag("stage", "hemobp-bp")
+                    mlflow.set_tag("run_id", config.run_id)
+                    mlflow.set_tag("promotable", str(gates.promotable).lower())
+                    for s, (fam, nm) in shipped.items():
+                        mlflow.set_tag(f"shipped_{s}", f"{fam}:{nm}")
+                    mlflow.set_tag("shipped_detector", det_name)
+                    for k, v in self._clean_metrics(headline).items():
+                        mlflow.log_metric(k, v)
+                    self.track_model_catalogue(
+                        config, R, shipped, off_report, offset_search, offset_model,
+                        det_report, det_report_val, det_name, tier_metrics_df, predictor)
+            except Exception as exc:
+                logging.warning("mlflow tracking skipped: %s", exc)
 
             model_trainer_artifact = ModelTrainerArtifact(
                 trained_model_file_path=config.trained_model_file_path,
@@ -617,10 +855,12 @@ class ModelTrainer:
                 at_budget = det_report[det_report.budget_pct == config.alert_budget_pct]
                 if len(at_budget):
                     observed_rate = float(at_budget.iloc[0].budget_pct) / 100.0
-            signals = pd.DataFrame([
-                mon.error_drift(ref_mae, cur_mae),
-                mon.alert_rate_drift(observed_rate, config.alert_budget_pct / 100.0),
-            ])
+            rows = [mon.error_drift(ref_mae, cur_mae),
+                    mon.alert_rate_drift(observed_rate, config.alert_budget_pct / 100.0)]
+            if "days_since_last_raw" in F.columns:
+                rows.append(mon.cadence_drift(ref.days_since_last_raw,
+                                              cur.days_since_last_raw))
+            signals = pd.DataFrame(rows)
             save_report(config.report_path("drift_signals.csv"), signals)
 
             n_alarm = int((psi.status == "ALARM").sum() if len(psi) else 0) \

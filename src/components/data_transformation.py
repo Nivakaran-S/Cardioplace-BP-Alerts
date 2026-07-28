@@ -9,6 +9,7 @@ from src.exception.custom_exception import CustomException
 from src.logging.logger import logging, timer
 from src.utils.main_utils.utils import (save_dataframe, save_object, save_report,
                                         summarise, write_yaml_file)
+from src.utils.ml_utils.feature.cadence import cadence_audit
 from src.utils.ml_utils.feature.causal_features import (CausalFeatureBuilder, add_splits,
                                                         build_panel, feature_dictionary,
                                                         leakage_audit)
@@ -97,6 +98,23 @@ class DataTransformation:
                 logging.warning("leakage audit: %d probe(s) warned\n%s",
                                 len(warned), warned.to_string(index=False))
             logging.info("leakage audit clean: %d probes passed", int((audit.status == "PASS").sum()))
+
+            # Cadence probes sit beside the leakage ones for the same reason: the gap
+            # column is reconstructed in six places and silently becoming a model feature
+            # would change every estimator's input matrix without any other signal.
+            cad = cadence_audit(panel, features)
+            save_report(cfg.report_path("cadence_audit.csv")
+                        if hasattr(cfg, "report_path") else
+                        os.path.join(os.path.dirname(cfg.leakage_report_file_path),
+                                     "cadence_audit.csv"), cad)
+            cad_failed = cad[cad.status == "FAIL"]
+            if not cad_failed.empty:
+                raise AssertionError("cadence audit failed:\n"
+                                     + cad_failed.to_string(index=False))
+            logging.info("cadence audit clean: %d probes passed | %s",
+                         int((cad.status == "PASS").sum()),
+                         cad.loc[cad.probe.str.startswith("the clip"), "detail"].iloc[0]
+                         if (cad.probe.str.startswith("the clip")).any() else "")
 
             save_dataframe(cfg.panel_file_path, panel)
             save_dataframe(cfg.feature_file_path, F)

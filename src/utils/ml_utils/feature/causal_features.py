@@ -10,6 +10,7 @@ import pandas as pd
 
 from src.logging.logger import logging
 from src.utils.main_utils.utils import deterministic_patient_split
+from src.utils.ml_utils.feature.cadence import attach_cadence
 
 
 def build_panel(sessions: pd.DataFrame, static: pd.DataFrame, config) -> pd.DataFrame:
@@ -32,7 +33,7 @@ def build_panel(sessions: pd.DataFrame, static: pd.DataFrame, config) -> pd.Data
 
     p = df.sort_values(["patient_id", "ts"]).copy()
     p["series_id"] = p.patient_id
-    p["days_since_last"] = p.groupby("series_id").ts.diff().dt.days.fillna(2).clip(1, 30)
+    p = attach_cadence(p, by="series_id")
     p["step"] = p.groupby("series_id").cumcount()
     p = p.merge(static, on="patient_id", how="left")
 
@@ -76,10 +77,15 @@ class CausalFeatureBuilder:
     """
 
     STATIC_PASSTHROUGH = ["age", "is_male", "is_dm", "is_weekend", "days_since_last"]
+    # `days_since_last_raw` is the unclipped truth and must never become a model input --
+    # feature_names_ below admits every numeric column not listed here, so omitting it would
+    # silently grow the feature list and change every estimator's input matrix.
+    # `cadence_audit` asserts this rather than trusting the comment.
     DROP = {"ts", "series_id", "patient_id", "gender", "step", "age_band", "split",
             "patient_split", "sbp", "dbp", "idwg", "weight", "sbp_post", "sbp_min",
             "sbp_drop", "uf_total", "temperature", "weightstart", "weightend", "dryweight",
-            "n_meas", "pulse_pressure", "map_est", "DM", "keyindate", "datatime", "dow"}
+            "n_meas", "pulse_pressure", "map_est", "DM", "keyindate", "datatime", "dow",
+            "days_since_last_raw", "reading_age_days"}
 
     def __init__(self, config):
         self.config = config
@@ -150,7 +156,8 @@ class CausalFeatureBuilder:
                                and pd.api.types.is_numeric_dtype(out[c])]
         return out
 
-    def transform_for_inference(self, history: pd.DataFrame) -> pd.DataFrame:
+    def transform_for_inference(self, history: pd.DataFrame,
+                                as_of: pd.Timestamp = None) -> pd.DataFrame:
         """Feature row describing 'now' for one patient.
 
         Training pairs features at step t (which see <= t-1) with the reading at t+h. Applied
@@ -158,17 +165,26 @@ class CausalFeatureBuilder:
         puts the newest reading inside the .shift(1) window -- the exact training distribution --
         and makes horizon h mean h steps ahead of now. Getting this wrong shifts every forecast
         by one step and is invisible in offline metrics.
+
+        `as_of` is the moment the advisory is being asked for. Without it the placeholder is
+        parked one MEDIAN gap after the last reading, which silently asserts the patient is
+        up to date: someone who last logged 30 days ago got a forecast built as though they
+        had just logged. With it, the placeholder sits at the real "now", so the cadence
+        features carry the true staleness. `as_of=None` reproduces the old behaviour exactly,
+        which is what every offline caller relies on.
         """
         g = history.sort_values("ts").copy()
         med_gap = float(g.ts.diff().dt.days.median() or 2)
         ph = g.iloc[[-1]].copy()
-        ph["ts"] = g.ts.max() + pd.Timedelta(days=med_gap)
+        nominal = g.ts.max() + pd.Timedelta(days=med_gap)
+        ph["ts"] = nominal if as_of is None else max(pd.Timestamp(as_of),
+                                                     g.ts.max() + pd.Timedelta(days=1))
         for c in ("sbp", "dbp", "idwg", "weight", "sbp_drop", "uf_total"):
             if c in ph:
                 ph[c] = np.nan
         gg = pd.concat([g, ph], ignore_index=True)
         gg["series_id"] = str(g.patient_id.iloc[0])
-        gg["days_since_last"] = gg.ts.diff().dt.days.fillna(2).clip(1, 30)
+        gg = attach_cadence(gg, by=None)
         gg["step"] = np.arange(len(gg))
         gg["is_weekend"] = (gg.ts.dt.dayofweek >= 5).astype(int)
         for c, d in (("DM", 0), ("is_dm", 0), ("is_male", 0), ("age", 65.0)):

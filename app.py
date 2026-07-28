@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 from src.constants.training_pipeline import (ALERT_BUDGET_PCT, EMERGENCY_FLOOR_MMHG,
                                              POPULATION_THRESHOLD_MMHG, WARN_WINDOW)
 from src.logging.logger import logging
+from src.utils.ml_utils.feature.cadence import attach_cadence
 from src.utils.ml_utils.model.estimator import BPPredictor
 from src.utils.ml_utils.rule_engine.registry import EMERGENCY_TIERS, build_registry
 from src.utils.ml_utils.rule_engine.synthetic import (CONDITION_KEYS, MED_KEYS, SYMPTOM_KEYS,
@@ -54,6 +55,10 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 # Nothing here uses a GPU, but a Space that cannot be downgraded to cpu-basic must
 # still give ZeroGPU an entry point reachable from a Gradio event, or its supervisor
 # terminates the container. `spaces` is injected only on that tier.
+#
+# The entry point is `_gpu_entry_point`, a diagnostic button -- NOT the advisory handler.
+# Decorating the advisory handler makes every request queue for and consume a ZeroGPU
+# allocation for CPU work, which exhausts the runs limit in normal use.
 try:
     import spaces as _spaces
 except Exception:
@@ -189,6 +194,11 @@ class PredictRequest(BaseModel):
     patient_id: str = "demo"
     profile: Profile = Field(default_factory=Profile)
     readings: List[Reading] = Field(..., min_length=1)
+    as_of: Optional[str] = Field(
+        None, description="When the advisory is being asked for, ISO-8601. Defaults to now. "
+                          "Determines how stale the newest reading is, which decides whether "
+                          "a forecast is issued and whether the engine treats readings as "
+                          "current.")
 
 
 # --------------------------------------------------------------------- helpers
@@ -217,12 +227,16 @@ def _history_frame(req: PredictRequest) -> pd.DataFrame:
     return df
 
 
-def _engine_frame(req: PredictRequest) -> pd.DataFrame:
+def _engine_frame(req: PredictRequest, as_of: pd.Timestamp = None) -> pd.DataFrame:
     """Panel the ExtendedRuleEngine evaluates: vitals plus everything the user entered.
 
     This is where the 45 BLOCKED_ON_INPUTS rules come back. They are blocked because
     HEMOBP has no symptom/medication/condition columns to TRAIN on -- but the engine
     is deterministic, so a symptom typed into the dashboard fires its rule immediately.
+
+    `reading_age_days` is how old each reading is at evaluation time. The engine's stale
+    gate needs it: without it the gate reads the spacing to the PREVIOUS reading and
+    suppresses the emergency of anyone returning after a break.
     """
     p = req.profile
     rows = []
@@ -249,7 +263,9 @@ def _engine_frame(req: PredictRequest) -> pd.DataFrame:
         rows.append(row)
 
     df = pd.DataFrame(rows).sort_values("step").reset_index(drop=True)
-    df["days_since_last"] = df.ts.diff().dt.days.fillna(2).clip(1, 30)
+    df = attach_cadence(df, by=None)
+    now = pd.Timestamp(as_of) if as_of is not None else df.ts.max()
+    df["reading_age_days"] = (now - df.ts).dt.total_seconds() / 86400.0
     df["weight_delta_24h"] = df.weight.diff().fillna(0.0)
     # prev_emergency reaches the predicates as a column: itertuples rows are immutable
     df["prev_emergency"] = (df.sbp.shift(1) >= 180).fillna(False)
@@ -295,7 +311,7 @@ def _feature_frame(predictor: BPPredictor, history: pd.DataFrame) -> pd.DataFram
     """Causal features at every session, built once (batch), not per-session."""
     g = history.sort_values("ts").copy()
     g["series_id"] = str(g.patient_id.iloc[0])
-    g["days_since_last"] = g.ts.diff().dt.days.fillna(2).clip(1, 30)
+    g = attach_cadence(g, by=None)
     g["step"] = np.arange(len(g))
     g["is_weekend"] = (g.ts.dt.dayofweek >= 5).astype(int)
     return predictor.fb.transform(g)
@@ -496,9 +512,13 @@ def predict(req: PredictRequest):
     """All three models, the rule engine, and the two combined views."""
     predictor = _require_model()
     history = _history_frame(req)
+    # "Now" defaults to request time. Without it every reading is treated as current, so a
+    # patient who stopped logging months ago still receives a confident forecast and their
+    # last alert is reported as the live one.
+    as_of = pd.Timestamp(req.as_of) if req.as_of else pd.Timestamp.now().normalize()
 
     try:
-        advisory = predictor.predict(history)          # Models 1 + 2 + 3 at 'now'
+        advisory = predictor.predict(history, as_of=as_of)   # Models 1 + 2 + 3 at 'now'
     except Exception as exc:
         logging.exception("prediction failed")
         raise HTTPException(500, f"prediction failed: {type(exc).__name__}: {exc}")
@@ -512,19 +532,26 @@ def predict(req: PredictRequest):
                            in (predictor.b.get("shipped") or {}).items()}
 
     # Model 3 across the whole history, plus the backtest -- one feature build for both.
+    # The detector is skipped on a stale history for the same reason the forecast is: its
+    # score is the shipped forecaster's output measured against the patient's own band, so
+    # it inherits exactly the continuity assumption the staleness check just rejected.
+    stale = advisory.get("confidence_tier") == "stale"
     try:
         F = _feature_frame(predictor, history)
-        advisory["anomaly"] = _anomaly_series(predictor, F)
-        advisory["backtest"] = _backtest(predictor, F)
+        advisory["anomaly"] = None if stale else _anomaly_series(predictor, F)
+        advisory["backtest"] = _backtest(predictor, F)   # retrospective; always valid
     except Exception as exc:
         logging.warning("trend views unavailable: %s", exc)
         advisory["anomaly"] = None
         advisory["backtest"] = None
 
     # --- rule engine, on everything the user actually entered -------------------
+    # The engine still runs: its verdict on each reading is a fact about that reading, and
+    # `reading_age_days` lets it gate the ones that are no longer current rather than
+    # reporting a months-old alert as the live one.
     thr = (advisory.get("personalisation") or {}).get("threshold")
     try:
-        frame = _engine_frame(req)
+        frame = _engine_frame(req, as_of=as_of)
         alerts = _run_engine(frame, thr)
         current = alerts.iloc[-1].to_dict()
         fired = alerts[alerts.fired]
@@ -542,40 +569,68 @@ def predict(req: PredictRequest):
         advisory["rule_engine"] = {"error": f"{type(exc).__name__}: {exc}"}
 
     # --- combined: run the engine on the FORECAST reading -----------------------
-    # This is the "what fires in ~2 days" view. Vitals come from Model 1; symptoms,
-    # medications and conditions are carried forward unchanged from the latest entry,
-    # because nothing in the corpus supports forecasting them.
+    # This is the "what fires in ~2 days" view. Only the vitals are predicted, so only
+    # the vitals drive the headline. Symptoms are NOT carried forward into it: a symptom
+    # typed in today would otherwise re-fire its rule at every horizon and be reported as
+    # a predicted emergency, when nothing was predicted at all -- it is the operator's own
+    # input echoed back. Carrying it forward is still shown, as an explicit conditional.
     try:
         fc = (advisory.get("forecast") or {}).get("sbp") or {}
         fc_d = (advisory.get("forecast") or {}).get("dbp") or {}
         predicted = []
-        base = _engine_frame(req)
+        base = _engine_frame(req, as_of=as_of)
+        today = base.tail(1)
+        active = [k for k in SYMPTOM_KEYS if int(today[k].iloc[0])]
         for key in sorted(fc, key=lambda k: fc[k]["steps_ahead"]):
             node = fc[key]
-            future = base.tail(1).copy()
+            future = today.copy()
             future["sbp"] = float(node["point"])
             if key in fc_d:
                 future["dbp"] = float(fc_d[key]["point"])
             future["step"] = int(base.step.max()) + node["steps_ahead"]
-            future["days_since_last"] = float(base.days_since_last.iloc[-1])
+            # For a hypothetical row at step t+h, `days_since_last` is the PROJECTED
+            # per-step cadence -- not today's realised gap (which is what it used to be,
+            # so a reading forecast six days out claimed two days since the last one) and
+            # not the cumulative h x gap, which would push the far horizons past the stale
+            # gate and make the whole panel vanish for anyone on a slower cadence.
+            # Deriving it from days_ahead_est keeps the "in ~6 days" label and the gap
+            # stamped on the row from ever disagreeing.
+            proj_gap = float(node["days_ahead_est"]) / max(int(node["steps_ahead"]), 1)
+            future["days_since_last"] = proj_gap
+            future["days_since_last_raw"] = proj_gap
+            future["reading_age_days"] = 0.0     # a forecast is never a back-dated entry
             future["prev_emergency"] = bool(base.sbp.iloc[-1] >= 180)
-            res = _run_engine(future, thr).iloc[0].to_dict()
-            predicted.append({
+
+            vitals_only = future.copy()
+            for k in SYMPTOM_KEYS:
+                vitals_only[k] = 0
+            res = _run_engine(vitals_only, thr).iloc[0].to_dict()
+            entry = {
                 "steps_ahead": node["steps_ahead"],
                 "days_ahead": node["days_ahead_est"],
                 "sbp": node["point"],
                 "dbp": fc_d.get(key, {}).get("point"),
                 "lo80": node.get("lo80"), "hi80": node.get("hi80"),
                 **_alert_payload(res),
-            })
+            }
+            if active:
+                carried = _run_engine(future, thr).iloc[0].to_dict()
+                if carried.get("rule_id") != res.get("rule_id"):
+                    entry["if_symptoms_persist"] = _alert_payload(carried)
+            predicted.append(entry)
         advisory["predicted_alert"] = {
             "horizons": predicted,
-            "basis": ("rule engine evaluated on the forecast vitals; symptoms, "
-                      "medications and conditions carried forward unchanged"),
+            "basis": ("rule engine evaluated on the forecast vitals only. Conditions and "
+                      "medications persist by nature and are carried forward; symptoms "
+                      "are not, because a symptom is an event and assuming it recurs "
+                      "would report the operator's own input as a prediction."),
+            "symptoms_entered_today": active,
             "symptom_forecast_supported": False,
             "symptom_note": ("The corpus has no symptom history, so no symptom is "
-                             "forecast. Symptoms you enter are applied to the current "
-                             "reading and carried forward into the predicted alert."),
+                             "forecast. Symptoms you enter apply to the current reading. "
+                             "Where assuming one persists would change the alert, that "
+                             "is reported separately as `if_symptoms_persist` -- an "
+                             "assumption, not a forecast."),
         }
     except Exception as exc:
         logging.warning("predicted alert unavailable: %s", exc)
@@ -854,7 +909,12 @@ def _render_dashboard(a: dict) -> str:
                 + f'<span class="chip {cc}">'
                   f'{_esc(_pretty(x["tier"]) if x.get("tier") else "No alert")}</span>'
                 + (f'<p class="sub">{_esc(_pretty(x.get("rule_id")))}</p>'
-                   if x.get("rule_id") else "") + "</div>")
+                   if x.get("rule_id") else "")
+                # An assumption, kept visually subordinate to the forecast so it cannot
+                # be read as one.
+                + (f'<p class="sub">if symptoms persist: '
+                   f'{_esc(_pretty(x["if_symptoms_persist"].get("rule_id")))}</p>'
+                   if x.get("if_symptoms_persist") else "") + "</div>")
     else:
         h.append('<p class="hint">No forecast issued — below the cold-start floor.</p>')
     h.append("</div>")
@@ -1038,6 +1098,24 @@ def _render_dashboard(a: dict) -> str:
 
 
 @_maybe_gpu
+def _gpu_entry_point() -> str:
+    """The ZeroGPU entry point, and deliberately the ONLY one.
+
+    ZeroGPU's supervisor terminates a Space it finds without a `@spaces.GPU` function, so
+    one has to exist. It used to be `_gradio_predict` -- which meant every "Get advisory"
+    click requested a GPU allocation, queued for it, and spent quota on work that is
+    scikit-learn on CPU in about 46 ms and touches no GPU at any point. That is what
+    exhausted the runs limit; the advisory itself was never the beneficiary.
+
+    The allocation now happens only when someone presses the diagnostic button, so the
+    supervisor is satisfied at startup and ordinary use costs nothing.
+    """
+    import platform
+    return (f"tier={'zerogpu' if ZEROGPU else 'cpu'} · python={platform.python_version()} "
+            f"· model={'loaded' if STORE.ready else 'absent'} · "
+            "the advisory path is CPU-only and consumes no ZeroGPU quota")
+
+
 def _gradio_predict(readings_text, patient_id, age, sex, dm, pregnant, hf_type,
                     provider_target, conditions, medications, symptoms, position,
                     n_meas, missed_3d, adherence):
@@ -1144,6 +1222,13 @@ with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False,
                 g_tstatus = gr.Textbox(label="Pipeline status", lines=8,
                                        value="idle", interactive=False)
 
+            with gr.Accordion("Runtime", open=False):
+                gr.Markdown("The advisory path is CPU-only. This button is the Space's "
+                            "single GPU entry point and is the only thing here that "
+                            "spends ZeroGPU quota.")
+                g_diag = gr.Button("Check runtime")
+                g_diagout = gr.Textbox(label="Runtime", lines=2, interactive=False)
+
         with gr.Column(scale=2):
             g_out = gr.HTML(value=f'<div class="cp">{DASH_CSS}<div class="bn">'
                                   "<span>&#9675;</span><div><h4>No advisory yet</h4>"
@@ -1160,6 +1245,9 @@ with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False,
                 [g_out, g_json])
     g_train.click(_gradio_train, None, g_tstatus)
     g_refresh.click(_gradio_train_status, None, g_tstatus)
+    # Binds the decorated function to a real Gradio event, which is what the supervisor
+    # scans for. Nothing on the advisory path reaches it.
+    g_diag.click(_gpu_entry_point, None, g_diagout)
 
 # Off-Space, FastAPI owns the server and Gradio is mounted under it.
 app = gr.mount_gradio_app(app, demo, path="/gradio")

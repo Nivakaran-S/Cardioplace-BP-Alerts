@@ -17,7 +17,7 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from src.constants.training_pipeline import GOVERNANCE_KEYS, SEED
+from src.constants.training_pipeline import GOVERNANCE_KEYS, SEED, STALE_FORECAST_MAX_DAYS
 from src.exception.custom_exception import CustomException
 from src.logging.logger import logging
 from src.utils.ml_utils.feature.causal_features import CausalFeatureBuilder
@@ -351,10 +351,16 @@ class BPPredictor:
             male = int(g.is_male.iloc[0]) if "is_male" in g else 0
 
             pers = self.offset.threshold_for(g.sbp, age, male)
-            out = dict(patient_id=pid, as_of=str(as_of or g.ts.max()),
+            last_ts = g.ts.max()
+            now = pd.Timestamp(as_of) if as_of is not None else last_ts
+            age_days = float((now - last_ts).total_seconds() / 86400.0)
+            out = dict(patient_id=pid, as_of=str(now),
                        model_version=b["model_version"], n_observations=n_obs,
                        confidence_tier=tier, personalisation=pers, forecast={},
-                       early_warning=None, emergency_floor_mmHg=c.emergency_floor_mmHg)
+                       early_warning=None, emergency_floor_mmHg=c.emergency_floor_mmHg,
+                       staleness=dict(last_reading=str(last_ts),
+                                      days_since_last_reading=round(age_days, 1),
+                                      max_forecast_age_days=STALE_FORECAST_MAX_DAYS))
 
             if tier == "cold_start":
                 out["note"] = (f"fewer than {c.cold_start_min_readings} readings; cohort "
@@ -362,7 +368,21 @@ class BPPredictor:
                 out["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
                 return out
 
-            row = self.fb.transform_for_inference(g)
+            # A forecast built on a history this old asserts a continuity the data does not
+            # support: every lag, window and EWMA describes a patient who has since been
+            # unobserved for longer than the engine's own staleness threshold. Refusing is
+            # the honest answer, and it mirrors the cold-start return directly above --
+            # personalisation still stands, because a threshold is a property of the
+            # patient's band, not of how recently they logged.
+            if age_days > STALE_FORECAST_MAX_DAYS:
+                out["confidence_tier"] = "stale"
+                out["note"] = (f"last reading is {age_days:.0f} days old, beyond the "
+                               f"{STALE_FORECAST_MAX_DAYS}-day limit; personalised "
+                               f"threshold only, no forecast and no early warning issued")
+                out["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                return out
+
+            row = self.fb.transform_for_inference(g, as_of=as_of)
             X = row.reindex(columns=b["feature_names"])
             med_gap = float(g.ts.diff().dt.days.median() or 2)
 

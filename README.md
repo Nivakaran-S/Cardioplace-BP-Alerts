@@ -45,10 +45,13 @@ Every one of those layers is chosen by an evaluation, and the evaluation is **bi
 - **Model 3** ships the highest-precision detector the bundle can evaluate, selected on
   **validation** at the alert budget. That is a forecast-relative detector — "is this
   patient heading above their *own* band" — not a population outlier model.
-- **Model 2** is retained on a `BASELINE` verdict rather than swapped, because once the
-  governance caps are applied to every candidate the alternatives are constants and
-  replacing the blend would delete personalisation instead of simplifying it. The verdict
-  is still recorded in `offset_scorecard.csv` and the artifact.
+- **Model 2** is retained on a `BASELINE` verdict rather than swapped. Every candidate is
+  capped to the legal band first — the raw personal band reaches 195 mmHg and would breach
+  the emergency floor for 24 of 150 patients, so it was never a shippable rival. Once
+  capped, cohort-only is a constant 155 for everyone, and personal-only has no shrinkage,
+  so a patient with five readings gets a threshold set by five readings. The remaining
+  separation is well inside the bootstrap CI. `BASELINE` here means "not proven better",
+  and it is recorded as such in `offset_scorecard.csv` and the artifact.
 
 The ML layer produces provider-visible **advisories**. It never writes a
 DeviationAlert, and the emergency floor (SBP ≥ 180 / DBP ≥ 120) is never
@@ -104,9 +107,11 @@ Gradio event invokes, since its model is *event → allocate GPU → run → rel
 package on ZeroGPU alone, so on cpu-basic the decorator is the identity function and
 nothing changes. `GET /api/health` reports the detected tier.
 
-On ZeroGPU each prediction from the Gradio tab takes a GPU allocation it does not
-need, so it queues and draws on the tier's quota. Requests to `/api/predict` are not
-Gradio events and are unaffected.
+The entry point is a **diagnostic button**, not the advisory handler. Decorating the
+handler makes every "Get advisory" click queue for a GPU allocation and spend quota on
+scikit-learn work that runs in ~46 ms and touches no GPU — which exhausts the ZeroGPU
+runs limit in ordinary use. Normal use now costs no quota. If you hit the limit anyway,
+adding `HF_TOKEN` as a Space secret raises it.
 
 ```bash
 curl -X POST localhost:7860/api/predict -H "Content-Type: application/json" -d '{
@@ -125,9 +130,54 @@ Only MLflow is configured by environment; everything else lives in
 MLFLOW_TRACKING_URI=https://dagshub.com/<owner>/<repo>.mlflow
 MLFLOW_TRACKING_USERNAME=<username>
 MLFLOW_TRACKING_PASSWORD=<access token>
+MLFLOW_LOG_CANDIDATES=1        # optional; 0 logs only the models that ship
 ```
 
+Note the `.mlflow` suffix — the DagsHub *clone* URL ends in `.git` and gives a 404 here.
 Unset, MLflow falls back to a local `mlruns/` store and the pipeline runs normally.
+On a Space these are **Space** secrets, not GitHub repository secrets: training runs
+inside the Space, so the Actions runner's copies are not visible to it.
+
+### What lands in MLflow
+
+A parent run per pipeline run, and a nested child run per model fitted — 136 on this
+cohort. Every candidate the pipeline chose between is recorded with its val *and* test
+metrics, so the selection is auditable from the tracking store alone.
+
+| Tag | Values |
+|---|---|
+| `category` | `forecaster` · `offset` · `offset-search` · `detector` · `classifier` |
+| `selection` | `final` (it serves) · `candidate` (it lost) |
+| `is_final` | `true` / `false` — same thing, for filtering |
+| plus | `signal`, `horizon`, `family`, `model` / `detector`, `run_id` |
+
+Only finals carry a serialised estimator and a registry name (`hemobp-forecaster-sbp-h1`,
+`hemobp-detector`, `hemobp-offset`); logging ~130 artefacts nothing will load would
+multiply storage for nothing. `MLFLOW_LOG_CANDIDATES=0` drops the candidate runs when the
+tracking server is remote and 136 round trips per pipeline run is too many.
+
+`final` follows the **ship decision**, not the sweep — so today the baselines are tagged
+final, because they are what actually serves.
+
+## Missed readings
+
+Users skip days. Nothing is imputed: a skipped reading is an absent row, and
+`days_since_last` carries the spacing. A daily grid would fabricate ~57% of its rows and
+teach the forecaster to recover its own interpolator.
+
+| | |
+|---|---|
+| One definition | `src/utils/ml_utils/feature/cadence.py` — six copies previously, one already drifted |
+| Model input | `days_since_last`, clipped to [1, 30] |
+| The truth | `days_since_last_raw`, unclipped, **never a feature**, asserted by `cadence_audit` |
+| Contract | asserts on the raw gap: strictly positive, clip binding on <1% of rows, no forward-filled runs |
+| Robustness | `missingness_robustness.csv` — deleting 35% of sessions costs 0.35 mmHg (gate 10) |
+| Drift | `DriftMonitor.cadence_drift`, PSI on the raw gap, its own signal |
+
+A reading older than `STALE_FORECAST_MAX_DAYS` (14, the same number the rule engine uses)
+gets the personalised threshold but **no forecast and no early warning** — the lags and
+windows describe a patient who has since been unobserved. Pass `as_of` to `/api/predict`
+to control what "now" means; it defaults to request time.
 
 ## Governance
 
@@ -141,6 +191,11 @@ never tuned, and asserted throughout:
 | Offset caps | +15 loosen / −25 tighten (asymmetric on purpose) |
 | Alert budget | 5% of patient-steps |
 | Warning window | 3 sessions |
+| Stale forecast limit | 14 days (asserted equal to the engine's `STALE_GAP_DAYS`) |
+
+Promotion is gated on them: a run with a critical gate failure keeps its own artifact and
+leaves `final_model/model.pkl` untouched, rather than logging "PROMOTION BLOCKED" after
+having already overwritten it.
 
 ## Data
 

@@ -141,6 +141,12 @@ ALERT_BUDGET_PCT: float = 5.0        # staffing capacity, not a statistic
 WARN_WINDOW: int = 3                 # sessions of lead time the detector must deliver
 EVENT_QUANTILE: float = 0.95         # personal quantile defining a high-BP event
 
+# How old the newest reading may be before a forecast is refused. Deliberately the same
+# number as RuleEngine.STALE_GAP_DAYS: if the engine has already stopped treating a reading
+# as current, the forecaster must not still be projecting from it. One threshold means the
+# two layers cannot disagree about what "stale" means.
+STALE_FORECAST_MAX_DAYS: int = 14
+
 GOVERNANCE_KEYS: list = [
     "population_threshold_mmHg",
     "emergency_floor_mmHg",
@@ -149,6 +155,7 @@ GOVERNANCE_KEYS: list = [
     "alert_budget_pct",
     "warn_window",
     "event_quantile",
+    "stale_forecast_max_days",
 ]
 
 # Offset blend defaults (searched over warm/k/q; the caps above are deliberately excluded).

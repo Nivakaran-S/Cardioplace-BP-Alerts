@@ -2,16 +2,31 @@ import os
 import sys
 from dataclasses import dataclass
 
-import numpy as np
 import pandas as pd
 from scipy.stats import ks_2samp
 
-from src.constants.training_pipeline import INGEST_RANGES, SCHEMA_FILE_PATH
+from src.constants.training_pipeline import (INGEST_RANGES, SCHEMA_FILE_PATH,
+                                             STALE_FORECAST_MAX_DAYS)
 from src.entity.artifact_entity import DataIngestionArtifact, DataValidationArtifact
 from src.entity.config_entity import DataValidationConfig
 from src.exception.custom_exception import CustomException
 from src.logging.logger import logging
 from src.utils.main_utils.utils import read_yaml_file, save_report, write_yaml_file
+from src.utils.ml_utils.feature.cadence import (GAP_CLIP_HI_DAYS, attach_cadence,
+                                                raw_gap_days)
+# The contract's notion of "stale" must be the engine's, by construction rather than by
+# two constants that happen to agree today.
+from src.utils.ml_utils.rule_engine.engine import RuleEngine
+
+STALE_GAP_DAYS = RuleEngine.STALE_GAP_DAYS
+
+# The engine stops treating a reading as current at STALE_GAP_DAYS; the predictor stops
+# forecasting from it at STALE_FORECAST_MAX_DAYS. If those ever diverge there is a window
+# where the forecaster projects from a reading the engine has already written off, so the
+# agreement is asserted rather than left to whoever edits one of them next.
+assert RuleEngine.STALE_GAP_DAYS == STALE_FORECAST_MAX_DAYS, (
+    f"staleness thresholds disagree: engine gates at {RuleEngine.STALE_GAP_DAYS} d but the "
+    f"forecaster refuses at {STALE_FORECAST_MAX_DAYS} d")
 
 
 @dataclass
@@ -71,21 +86,66 @@ class DataContract:
         self._add("range: pulse pressure >= 10 mmHg", pp_bad < self.MAX_OUT_OF_RANGE,
                   f"{pp_bad:.3%} violate")
 
+    MAX_CLIPPED_GAP_FRAC = 0.01
+    MAX_FLAT_REPEAT_FRAC = 0.05
+
     def _structure(self, raw, panel, min_sessions):
+        """Structural checks, all of which can actually fail.
+
+        Two of these previously could not. "gaps positive and bounded" asserted
+        1 <= days_since_last <= 30 on a column that had just been clipped to [1, 30], and
+        "step index contiguous from 0" asserted contiguity of a cumcount() output. Both
+        passed by construction and told us nothing -- the first hid the fact that this
+        corpus contains gaps up to 124 days. They now assert on `days_since_last_raw`,
+        the unclipped truth, and on properties the pipeline does not itself guarantee.
+        """
         dup = int(raw.duplicated(["patient_id", "ts"]).sum())
         self._add("structure: unique (patient, session)", dup == 0, f"{dup} duplicates",
                   critical=True)
         self._add("structure: timestamps increasing within patient",
                   panel.groupby("series_id").ts.apply(lambda s: s.is_monotonic_increasing).all(),
                   critical=True)
-        self._add("structure: step index contiguous from 0",
-                  panel.groupby("series_id").step
-                       .apply(lambda s: bool((s.values == np.arange(len(s))).all())).all(),
+
+        raw_gap = panel.days_since_last_raw.dropna()
+        # C1 -- a non-positive gap means two readings share a timestamp. While `ts` is
+        # date-only this overlaps the duplicate check; the moment timestamps carry a time
+        # component it becomes the only check that catches it.
+        n_bad = int((raw_gap <= 0).sum())
+        self._add("structure: session gaps strictly positive", n_bad == 0,
+                  f"{n_bad} of {len(raw_gap):,} non-positive", critical=True)
+
+        # C3 -- the clip is a guard against a pathological value, not a transform applied
+        # to a material share of the data. Past 1% the feature stops meaning "days since
+        # the last reading" for enough rows that the model is training on a censored
+        # variable without saying so, and the fix is to raise the ceiling and retrain.
+        over = float((raw_gap > GAP_CLIP_HI_DAYS).mean()) if len(raw_gap) else 0.0
+        self._add("structure: the cadence clip is a guard, not a transform",
+                  over < self.MAX_CLIPPED_GAP_FRAC,
+                  f"{over:.3%} of gaps exceed the {GAP_CLIP_HI_DAYS:.0f}-day ceiling "
+                  f"(max {raw_gap.max():.0f}d, budget {self.MAX_CLIPPED_GAP_FRAC:.0%})",
                   critical=True)
-        g = panel.days_since_last
-        self._add("structure: gaps positive and bounded",
-                  bool((g >= 1).all() and (g <= 30).all()),
-                  f"gap range [{g.min():.0f}, {g.max():.0f}] days", critical=True)
+
+        # C2 -- how often a reading arrives after the engine's staleness threshold. Not
+        # critical: a rising stale rate is a fact about patient behaviour, not a data
+        # defect, and blocking a training run on it would be wrong. It has to be visible.
+        stale = float((raw_gap > STALE_GAP_DAYS).mean()) if len(raw_gap) else 0.0
+        self._add("structure: sessions following a stale gap are rare",
+                  stale < self.MAX_OUT_OF_RANGE,
+                  f"{stale:.3%} of gaps exceed the {STALE_GAP_DAYS}-day staleness threshold")
+
+        # C4 -- replaces the contiguity tautology. Forward-filling a daily grid is the one
+        # thing panel construction forbids; its signature is consecutive rows carrying
+        # identical vitals exactly one day apart. A real ffill drives this toward the fill
+        # fraction (~57% on this cadence), so the threshold sits far above noise and far
+        # below the failure mode.
+        prev_same = (panel.sbp.eq(panel.sbp.shift(1)) & panel.dbp.eq(panel.dbp.shift(1))
+                     & panel.series_id.eq(panel.series_id.shift(1))
+                     & panel.days_since_last_raw.eq(1))
+        flat = float(prev_same.mean())
+        self._add("structure: no forward-filled runs", flat < self.MAX_FLAT_REPEAT_FRAC,
+                  f"{flat:.3%} of rows repeat the previous vitals one day apart "
+                  f"(a daily-grid ffill would approach the fill fraction)", critical=True)
+
         short = int((panel.groupby("series_id").size() < min_sessions).sum())
         self._add(f"structure: every patient has >= {min_sessions} sessions", short == 0,
                   f"{short} below floor", critical=True)
@@ -115,6 +175,68 @@ class DataContract:
         if fails:
             raise AssertionError("data contract violated:\n"
                                  + "\n".join(f"  - {c.name}: {c.detail}" for c in fails))
+
+    @classmethod
+    def self_test(cls) -> pd.DataFrame:
+        """Prove each structural check bites, by feeding it data that should trip it.
+
+        A check that cannot fail is worse than no check: it reports PASS forever and is
+        read as evidence. Two of these were exactly that before -- they asserted bounds on
+        a column the pipeline had just clipped to those bounds. This runs every structural
+        predicate against a frame built to violate it and asserts the violation is caught.
+        """
+        base = pd.DataFrame({
+            "patient_id": ["p"] * 6, "series_id": ["p"] * 6,
+            "ts": pd.to_datetime(["2026-01-01", "2026-01-03", "2026-01-05",
+                                  "2026-01-07", "2026-01-09", "2026-01-11"]),
+            "sbp": [140.0, 142, 144, 146, 148, 150], "dbp": [80.0, 81, 82, 83, 84, 85],
+            "age": [68.0] * 6, "gender": ["M"] * 6,
+        })
+        base = attach_cadence(base, by="series_id")
+        base["step"] = range(len(base))
+
+        def corrupt_duplicate(d):
+            d = pd.concat([d, d.tail(1)], ignore_index=True)
+            return attach_cadence(d, by="series_id")
+
+        def corrupt_backwards(d):
+            d = d.copy()
+            d.loc[3, "ts"] = pd.Timestamp("2025-12-01")
+            return attach_cadence(d, by="series_id")
+
+        def corrupt_huge_gap(d):
+            d = d.copy()
+            d.loc[4, "ts"] = pd.Timestamp("2027-01-01")   # ~1 year, far past the ceiling
+            return attach_cadence(d, by="series_id")
+
+        def corrupt_ffill(d):
+            d = d.copy()
+            d["ts"] = pd.date_range("2026-01-01", periods=len(d), freq="D")
+            d["sbp"] = 140.0
+            d["dbp"] = 80.0
+            return attach_cadence(d, by="series_id")
+
+        cases = [
+            ("structure: unique (patient, session)", corrupt_duplicate),
+            ("structure: timestamps increasing within patient", corrupt_backwards),
+            ("structure: the cadence clip is a guard, not a transform", corrupt_huge_gap),
+            ("structure: no forward-filled runs", corrupt_ffill),
+            ("structure: every patient has >= 60 sessions", lambda d: d),
+        ]
+        rows = []
+        for name, fn in cases:
+            bad = fn(base)
+            c = cls()
+            c._structure(bad, bad, min_sessions=60)
+            hit = next((x for x in c.checks if x.name == name), None)
+            rows.append(dict(check=name,
+                             caught=bool(hit is not None and hit.status == "FAIL"),
+                             detail=hit.detail if hit else "check not emitted"))
+        out = pd.DataFrame(rows)
+        n_ok = int(out.caught.sum())
+        logging.info("contract self-test: %d/%d structural checks provably bite",
+                     n_ok, len(out))
+        return out
 
 
 class DataValidation:
@@ -209,14 +331,24 @@ class DataValidation:
             # is just the session frame indexed by step -- re-merging would suffix the columns.
             panel = sessions.sort_values(["patient_id", "ts"]).copy()
             panel["series_id"] = panel.patient_id
-            panel["days_since_last"] = (panel.groupby("series_id").ts.diff().dt.days
-                                        .fillna(2).clip(1, 30))
+            # Carries `days_since_last_raw` as well; the structural checks assert on the raw
+            # column, because asserting on the clipped one cannot fail.
+            panel = attach_cadence(panel, by="series_id")
             panel["step"] = panel.groupby("series_id").cumcount()
             # The contract's session floor applies to the admitted cohort; at this stage the
             # frame is still every patient, so check against the cohort that will be admitted.
             admitted = panel.groupby("series_id").size()
             keep = admitted[admitted >= self.data_validation_config.min_sessions].index
             panel_admitted = panel[panel.series_id.isin(keep)]
+
+            # Run the self-test BEFORE the contract: a suite that cannot fail must not be
+            # allowed to report PASS on real data, so a blunt check is itself a failure.
+            st = DataContract.self_test()
+            if not bool(st.caught.all()):
+                raise AssertionError(
+                    "data contract self-test failed -- these checks cannot detect the "
+                    "corruption they exist for:\n"
+                    + "\n".join(f"  - {r.check}" for r in st[~st.caught].itertuples()))
 
             contract = DataContract(self.data_validation_config.max_out_of_range)
             report = contract.validate(sessions, static, panel_admitted,
@@ -225,7 +357,9 @@ class DataValidation:
             n_pass = int((report.status == "PASS").sum())
             n_warn = int((report.status == "WARN").sum())
             n_fail = int((report.status == "FAIL").sum())
-            logging.info("data contract: %d pass | %d warn | %d fail", n_pass, n_warn, n_fail)
+            logging.info("data contract: %d pass | %d warn | %d fail | %d/%d checks "
+                         "self-tested", n_pass, n_warn, n_fail,
+                         int(st.caught.sum()), len(st))
             contract.enforce()
             logging.info("data contract satisfied")
 

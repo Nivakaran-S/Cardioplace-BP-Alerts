@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from src.utils.ml_utils.feature.cadence import attach_cadence
 from src.utils.ml_utils.rule_engine.engine import RuleEngine
 from src.utils.ml_utils.rule_engine.registry import EMERGENCY_TIERS
 
@@ -173,7 +174,7 @@ def generate_synthetic_cohort(cfg: SynthConfig = SCFG) -> pd.DataFrame:
     for i in range(cfg.n_patients):
         p = _assign_patient(rng, i, cfg)
         adh_state, resid, miss_hist, brady_run = "ADHERENT", 0.0, [], 0
-        step, last_ts, prev_hr_high_day = 0, None, -99
+        step, prev_hr_high_day = 0, -99
         for d in range(cfg.n_days):
             ts = t0 + pd.Timedelta(days=d)
             weekend = ts.dayofweek >= 5
@@ -252,7 +253,6 @@ def generate_synthetic_cohort(cfg: SynthConfig = SCFG) -> pd.DataFrame:
 
             rows.append(dict(
                 series_id=p["series_id"], step=step, ts=ts,
-                days_since_last=1.0 if last_ts is None else float((ts - last_ts).days),
                 n_meas=(1 if d in p["lone_reading_days"] else int(rng.integers(2, 4))),
                 sbp=float(sbp), dbp=float(dbp), pulse=float(hr), weight=float(weight),
                 weight_delta_24h=float(wdelta), idwg=np.nan,
@@ -267,9 +267,13 @@ def generate_synthetic_cohort(cfg: SynthConfig = SCFG) -> pd.DataFrame:
                 archetype=p["archetype"],
                 **{k: p[k] for k in CONDITION_KEYS}, **{k: p[k] for k in MED_KEYS}, **s))
             step += 1
-            last_ts = ts
 
     df = pd.DataFrame(rows)
+    # This cohort is generated daily, so it does NOT share the real panel's conventions: a
+    # first row is 1 day not 2, and gaps stay unclipped so the generator's deliberate skips
+    # reach the stale gate at their true length. Routing it through the same function with
+    # explicit arguments turns what used to be an accidental divergence into a declared one.
+    df = attach_cadence(df, by="series_id", first=1.0, lo=None, hi=None)
     df["is_synthetic"] = True
     df["patient_split"] = np.where(
         pd.util.hash_pandas_object(df.series_id, index=False) % 10 < 3, "holdout", "fit")
