@@ -206,6 +206,105 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, .btn:focus-vi
   background: color-mix(in srgb, var(--status-critical) 7%, transparent);
 }
 
+/* ------------------------------------------------- checks / groups / tags */
+
+.section-h { margin: 22px 0 10px !important; padding-top: 16px; border-top: 1px solid var(--border); }
+.section-h .hint { display: block; font-weight: 400; margin-top: 2px; }
+.input-panel { max-height: calc(100vh - 110px); overflow-y: auto; }
+
+.group { margin: 12px 0; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.group > summary {
+  cursor: pointer; padding: 8px 11px; font-size: 0.82rem; font-weight: 500;
+  color: var(--text-secondary); user-select: none;
+  display: flex; align-items: center; gap: 8px;
+}
+.group > summary:hover { color: var(--text-primary); }
+.group .checks { padding: 4px 11px 11px; }
+
+.checks { display: flex; flex-wrap: wrap; gap: 5px; }
+.chk {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 0.76rem; padding: 4px 9px;
+  border: 1px solid var(--border); border-radius: 999px;
+  cursor: pointer; user-select: none; color: var(--text-secondary);
+  background: var(--surface-1); transition: all .12s ease;
+}
+.chk:hover { border-color: var(--series-1); color: var(--text-primary); }
+.chk input { display: none; }
+.chk.on {
+  background: color-mix(in srgb, var(--series-1) 14%, transparent);
+  border-color: var(--series-1); color: var(--text-primary); font-weight: 500;
+}
+.chk.on.red {
+  background: color-mix(in srgb, var(--status-critical) 14%, transparent);
+  border-color: var(--status-critical);
+}
+
+.tag {
+  display: inline-block; font-size: 0.66rem; font-weight: 600;
+  padding: 2px 6px; border-radius: 4px; letter-spacing: .03em;
+  background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+  color: var(--text-secondary); vertical-align: middle;
+}
+.tag-model {
+  background: color-mix(in srgb, var(--series-1) 16%, transparent);
+  color: var(--series-1);
+}
+
+.accent { border-left: 3px solid var(--series-1); }
+.btn-sm { padding: 5px 10px; font-size: 0.76rem; }
+
+/* -------------------------------------------------------- horizon cards */
+
+.horizon-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px;
+}
+.horizon {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 12px 14px; background: var(--plane);
+}
+.horizon-when {
+  font-size: 0.72rem; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--text-muted); margin: 0 0 6px;
+}
+.horizon-bp { margin: 0; font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em; }
+.horizon-bp .unit { font-size: 0.74rem; font-weight: 500; color: var(--text-muted); margin-left: 4px; }
+.horizon-band { margin: 2px 0 8px; font-size: 0.73rem; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; }
+.horizon-rule { margin: 5px 0 0; font-size: 0.73rem; color: var(--text-secondary); }
+
+/* ------------------------------------------------------------- timeline */
+
+.timeline { display: flex; flex-wrap: wrap; gap: 3px; margin-bottom: 14px; }
+.tl {
+  width: 13px; height: 22px; border-radius: 3px;
+  background: color-mix(in srgb, var(--text-muted) 20%, transparent);
+}
+.tl-BP_LEVEL_2, .tl-BP_LEVEL_2_SYMPTOM_OVERRIDE, .tl-TIER_1_ANGIOEDEMA {
+  background: var(--status-critical); }
+.tl-TIER_1_CONTRAINDICATION { background: var(--status-serious); }
+.tl-TIER_2_DISCREPANCY { background: var(--status-warning); }
+.tl-BP_LEVEL_1_HIGH { background: var(--series-2); }
+.tl-BP_LEVEL_1_LOW { background: var(--series-1); }
+.tl-TIER_3_INFO { background: color-mix(in srgb, var(--text-muted) 45%, transparent); }
+
+/* ---------------------------------------------------------- train panel */
+
+.train-panel {
+  margin: 0 24px; padding: 12px 16px;
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--radius); border-left: 3px solid var(--status-warning);
+}
+.train-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.train-head .hint { flex: 1; }
+.train-log {
+  margin: 10px 0 0; padding: 10px; max-height: 210px; overflow: auto;
+  background: var(--plane); border-radius: var(--radius-sm);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.72rem; line-height: 1.5; color: var(--text-secondary);
+  white-space: pre-wrap; word-break: break-word;
+}
+
 /* ---------------------------------------------------------------- banner */
 
 .banner {

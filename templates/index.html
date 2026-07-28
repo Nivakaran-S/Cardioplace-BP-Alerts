@@ -12,65 +12,101 @@
       <span class="brand-mark" aria-hidden="true"></span>
       <div>
         <h1>Cardioplace BP Alerts</h1>
-        <p class="brand-sub">Blood-pressure forecasting, personalisation and early warning</p>
+        <p class="brand-sub">Forecasting · personalisation · early warning · rule engine</p>
       </div>
     </div>
     <div class="topbar-right">
       <span id="model-chip" class="chip chip-muted">checking model…</span>
+      <button id="btn-train" class="btn btn-ghost" type="button">Train model</button>
       <button id="theme-toggle" class="btn btn-ghost" type="button" aria-label="Toggle theme">
         <span data-theme-icon>◐</span>
       </button>
     </div>
   </header>
 
+  <div id="train-panel" class="train-panel" hidden>
+    <div class="train-head">
+      <span id="train-state" class="chip">idle</span>
+      <p id="train-note" class="hint"></p>
+      <button id="train-close" class="btn btn-ghost btn-sm" type="button">Hide</button>
+    </div>
+    <pre id="train-log" class="train-log"></pre>
+  </div>
+
   <main class="layout">
     <!-- ------------------------------------------------------------ input -->
-    <section class="panel" aria-labelledby="input-h">
+    <section class="panel input-panel" aria-labelledby="input-h">
       <h2 id="input-h">Patient</h2>
 
       <div class="field-row">
-        <label class="field">
-          <span>Patient ID</span>
-          <input id="patient-id" type="text" value="demo-001" autocomplete="off">
-        </label>
-        <label class="field field-sm">
-          <span>Age</span>
-          <input id="age" type="number" min="18" max="110" value="68">
-        </label>
+        <label class="field"><span>Patient ID</span>
+          <input id="patient-id" type="text" value="demo-001" autocomplete="off"></label>
+        <label class="field field-sm"><span>Age</span>
+          <input id="age" type="number" min="18" max="110" value="68"></label>
       </div>
 
       <div class="field-row">
-        <label class="field">
-          <span>Sex</span>
-          <select id="sex">
-            <option value="0">Female</option>
-            <option value="1" selected>Male</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>Diabetes</span>
-          <select id="dm">
-            <option value="0" selected>No</option>
-            <option value="1">Yes</option>
-          </select>
-        </label>
+        <label class="field"><span>Sex</span>
+          <select id="sex"><option value="0">Female</option>
+            <option value="1" selected>Male</option></select></label>
+        <label class="field"><span>Diabetes</span>
+          <select id="dm"><option value="0" selected>No</option>
+            <option value="1">Yes</option></select></label>
       </div>
 
-      <label class="field">
-        <span>
-          Session readings
-          <em class="hint">one per line — <code>YYYY-MM-DD, SBP, DBP</code></em>
-        </span>
-        <textarea id="readings" rows="12" spellcheck="false"></textarea>
-      </label>
+      <div class="field-row">
+        <label class="field"><span>Heart failure</span>
+          <select id="hf-type"><option value="NONE" selected>None</option>
+            <option value="HFREF">HFrEF</option><option value="HFPEF">HFpEF</option></select></label>
+        <label class="field"><span>Provider SBP target</span>
+          <input id="provider-target" type="number" min="80" max="200" placeholder="optional"></label>
+      </div>
 
+      <details class="group" open>
+        <summary>Conditions <span id="cond-count" class="tag">0</span></summary>
+        <div id="conditions" class="checks"></div>
+      </details>
+
+      <details class="group">
+        <summary>Medications <span id="med-count" class="tag">0</span></summary>
+        <div id="medications" class="checks"></div>
+      </details>
+
+      <div class="field-row">
+        <label class="field field-sm"><span>Missed doses (3d)</span>
+          <input id="missed-3d" type="number" min="0" max="3" value="0"></label>
+        <label class="field field-sm"><span>Adherence 7d</span>
+          <input id="adherence" type="number" min="0" max="1" step="0.05" value="1"></label>
+        <label class="field"><span>Pregnant</span>
+          <select id="pregnant"><option value="0" selected>No</option>
+            <option value="1">Yes</option></select></label>
+      </div>
+
+      <h2 class="section-h">Readings</h2>
+      <label class="field">
+        <span>Session history
+          <em class="hint">one per line — <code>date, SBP, DBP[, pulse, weight]</code></em></span>
+        <textarea id="readings" rows="10" spellcheck="false"></textarea>
+      </label>
       <p id="reading-count" class="hint" aria-live="polite"></p>
+
+      <h2 class="section-h">Today's symptoms
+        <span class="hint">applied to the most recent reading</span></h2>
+      <div id="symptoms" class="checks"></div>
+
+      <div class="field-row">
+        <label class="field"><span>Position</span>
+          <select id="position"><option value="SITTING" selected>Sitting</option>
+            <option value="STANDING">Standing</option>
+            <option value="LYING">Lying</option></select></label>
+        <label class="field field-sm"><span>Readings in session</span>
+          <input id="n-meas" type="number" min="1" max="5" value="2"></label>
+      </div>
 
       <div class="actions">
         <button id="btn-predict" class="btn btn-primary" type="button">Get advisory</button>
         <button id="btn-sample" class="btn btn-ghost" type="button">Load sample</button>
       </div>
-
       <p id="form-error" class="alert alert-error" hidden></p>
     </section>
 
@@ -80,12 +116,12 @@
 
       <div id="empty-state" class="panel empty">
         <p class="empty-title">No advisory yet</p>
-        <p class="hint">Enter a patient's session history and select <strong>Get advisory</strong>.
-           The model needs at least 7 readings before it will issue a forecast.</p>
+        <p class="hint">Enter the patient's history and select <strong>Get advisory</strong>.
+           The forecaster needs at least 7 readings before it will issue a prediction;
+           the rule engine fires on every reading regardless.</p>
       </div>
 
       <div id="output" hidden>
-        <!-- headline assessment -->
         <div id="banner" class="banner" role="status">
           <span id="banner-icon" class="banner-icon" aria-hidden="true"></span>
           <div class="banner-body">
@@ -95,114 +131,131 @@
           <span id="banner-meta" class="banner-meta"></span>
         </div>
 
-        <!-- stat tiles -->
+        <!-- ===================== COMBINED ===================== -->
+        <article class="panel accent">
+          <div class="panel-head">
+            <div><h3>Combined outlook</h3>
+              <p class="hint">Forecast vitals passed through the rule engine — what
+                 fires if the trend holds</p></div>
+            <span class="tag tag-model">M1 + M2 + engine</span>
+          </div>
+          <div id="predicted-alerts" class="horizon-grid"></div>
+          <p id="predicted-note" class="callout"></p>
+        </article>
+
         <div class="tiles">
           <article class="tile">
-            <p class="tile-label">Personalised threshold</p>
+            <p class="tile-label">Engine now <span class="tag">rule engine</span></p>
+            <p class="tile-value"><span id="v-engine-tier" class="chip">–</span></p>
+            <p id="v-engine-note" class="tile-note"></p>
+          </article>
+          <article class="tile">
+            <p class="tile-label">Threshold <span class="tag tag-model">M2</span></p>
             <p class="tile-value"><span id="v-threshold">–</span><span class="unit">mmHg</span></p>
             <p id="v-threshold-note" class="tile-note"></p>
           </article>
           <article class="tile">
-            <p class="tile-label">Confidence tier</p>
-            <p class="tile-value"><span id="v-tier">–</span></p>
-            <p id="v-tier-note" class="tile-note"></p>
-          </article>
-          <article class="tile">
-            <p class="tile-label">Early warning</p>
+            <p class="tile-label">Early warning <span class="tag tag-model">M3</span></p>
             <p class="tile-value"><span id="v-ew-chip" class="chip">–</span></p>
             <div class="meter" id="v-ew-meter" hidden>
               <div class="meter-track"><div id="v-ew-fill" class="meter-fill"></div></div>
-              <p class="meter-scale"><span id="v-ew-score">–</span><span>cut <span id="v-ew-cut">–</span></span></p>
+              <p class="meter-scale"><span id="v-ew-score">–</span>
+                 <span>cut <span id="v-ew-cut">–</span></span></p>
             </div>
             <p id="v-ew-note" class="tile-note"></p>
           </article>
+          <article class="tile">
+            <p class="tile-label">Confidence</p>
+            <p class="tile-value"><span id="v-tier">–</span></p>
+            <p id="v-tier-note" class="tile-note"></p>
+          </article>
         </div>
 
-        <!-- chart -->
+        <!-- ===================== MODEL 1 ===================== -->
         <article class="panel">
           <div class="panel-head">
-            <div>
-              <h3>Systolic blood pressure</h3>
-              <p class="hint" id="chart-sub">Observed history and forecast, per dialysis session</p>
-            </div>
+            <div><h3>Model 1 — forecaster</h3>
+              <p class="hint" id="chart-sub">Observed SBP and the forecast, per session</p></div>
             <div class="legend" id="legend"></div>
           </div>
-          <div class="chart-scroll">
-            <div id="chart" class="chart" role="img" aria-labelledby="chart-desc"></div>
-          </div>
+          <div class="chart-scroll"><div id="chart" class="chart" role="img"
+               aria-labelledby="chart-desc"></div></div>
           <p id="chart-desc" class="sr-only"></p>
-          <details class="table-view">
-            <summary>View as table</summary>
-            <div class="table-scroll">
-              <table id="chart-table">
-                <caption class="sr-only">Observed and forecast systolic blood pressure</caption>
-                <thead><tr><th scope="col">Session date</th><th scope="col">SBP (mmHg)</th>
-                  <th scope="col">DBP (mmHg)</th><th scope="col">Series</th></tr></thead>
-                <tbody></tbody>
-              </table>
-            </div>
-          </details>
-        </article>
-
-        <!-- anomaly trend -->
-        <article class="panel" id="anomaly-panel">
-          <div class="panel-head">
-            <div>
-              <h3>Early-warning detector</h3>
-              <p class="hint" id="anomaly-sub"></p>
-            </div>
-            <div class="legend" id="anomaly-legend"></div>
-          </div>
-          <div class="chart-scroll">
-            <div id="anomaly-chart" class="chart" role="img" aria-labelledby="anomaly-desc"></div>
-          </div>
-          <p id="anomaly-desc" class="sr-only"></p>
-          <p id="anomaly-headroom" class="callout"></p>
-          <details class="table-view">
-            <summary>View as table</summary>
-            <div class="table-scroll">
-              <table id="anomaly-table">
-                <caption class="sr-only">Detector score per session</caption>
-                <thead><tr><th scope="col">Session date</th><th scope="col">Score</th>
-                  <th scope="col">Cut</th><th scope="col">State</th></tr></thead>
-                <tbody></tbody>
-              </table>
-            </div>
-          </details>
-        </article>
-
-        <!-- forecast detail -->
-        <article class="panel">
-          <h3>Forecast horizons</h3>
           <div class="table-scroll">
             <table id="forecast-table">
-              <thead><tr>
-                <th scope="col">Horizon</th><th scope="col">Point (mmHg)</th>
-                <th scope="col">80% interval</th><th scope="col">Days ahead</th>
-                <th scope="col">vs threshold</th>
-              </tr></thead>
-              <tbody></tbody>
-            </table>
+              <thead><tr><th scope="col">Horizon</th><th scope="col">SBP</th>
+                <th scope="col">80% interval</th><th scope="col">Days</th>
+                <th scope="col">vs threshold</th></tr></thead>
+              <tbody></tbody></table>
           </div>
           <p id="interval-basis" class="hint"></p>
         </article>
 
-        <!-- governance -->
+        <!-- ============ BACKTEST: predicted-2-days-prior ============ -->
+        <article class="panel" id="backtest-panel">
+          <div class="panel-head">
+            <div><h3>What we predicted, against what happened</h3>
+              <p class="hint" id="backtest-sub"></p></div>
+            <div class="legend" id="backtest-legend"></div>
+          </div>
+          <div class="chart-scroll"><div id="backtest-chart" class="chart" role="img"
+               aria-labelledby="backtest-desc"></div></div>
+          <p id="backtest-desc" class="sr-only"></p>
+          <div class="table-scroll">
+            <table id="backtest-table">
+              <thead><tr><th scope="col">Horizon</th><th scope="col">Days ahead</th>
+                <th scope="col">n</th><th scope="col">MAE (mmHg)</th>
+                <th scope="col">within 10 mmHg</th></tr></thead>
+              <tbody></tbody></table>
+          </div>
+        </article>
+
+        <!-- ===================== MODEL 3 ===================== -->
+        <article class="panel" id="anomaly-panel">
+          <div class="panel-head">
+            <div><h3>Model 3 — early-warning detector</h3>
+              <p class="hint" id="anomaly-sub"></p></div>
+            <div class="legend" id="anomaly-legend"></div>
+          </div>
+          <div class="chart-scroll"><div id="anomaly-chart" class="chart" role="img"
+               aria-labelledby="anomaly-desc"></div></div>
+          <p id="anomaly-desc" class="sr-only"></p>
+          <p id="anomaly-headroom" class="callout"></p>
+        </article>
+
+        <!-- ===================== RULE ENGINE ===================== -->
+        <article class="panel">
+          <div class="panel-head">
+            <div><h3>Rule engine</h3>
+              <p class="hint">The permanent floor — never trained, never tuned</p></div>
+            <span id="engine-count" class="tag"></span>
+          </div>
+          <div id="engine-timeline" class="timeline"></div>
+          <div class="table-scroll">
+            <table id="engine-table">
+              <thead><tr><th scope="col">Session</th><th scope="col">Tier</th>
+                <th scope="col">Rule</th></tr></thead>
+              <tbody></tbody></table>
+          </div>
+          <p id="engine-note" class="callout"></p>
+        </article>
+
+        <!-- ===================== GOVERNANCE ===================== -->
         <article class="panel governance">
           <h3>Governance</h3>
           <ul class="gov-list">
             <li><span class="gov-key">Emergency floor</span>
                 <span id="v-floor" class="gov-val">–</span>
-                <span class="hint">never personalised — the rule engine fires regardless</span></li>
+                <span class="hint">never personalised — the engine fires regardless</span></li>
             <li><span class="gov-key">Population threshold</span>
                 <span id="v-pop" class="gov-val">–</span>
-                <span class="hint">the offset is applied against this, within capped bounds</span></li>
+                <span class="hint">the offset is applied against this, within caps</span></li>
             <li><span class="gov-key">Model version</span>
                 <span id="v-version" class="gov-val mono">–</span></li>
           </ul>
           <p class="disclaimer">
-            Provider-visible decision support. This is not a DeviationAlert and does not
-            replace the deterministic rule engine.
+            Provider-visible decision support. The ML layer never writes a DeviationAlert
+            and never moves an emergency threshold.
           </p>
         </article>
       </div>
