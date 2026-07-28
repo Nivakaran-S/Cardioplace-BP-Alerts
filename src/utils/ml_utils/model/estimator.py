@@ -21,7 +21,8 @@ from src.constants.training_pipeline import GOVERNANCE_KEYS, SEED
 from src.exception.custom_exception import CustomException
 from src.logging.logger import logging
 from src.utils.ml_utils.feature.causal_features import CausalFeatureBuilder
-from src.utils.ml_utils.metric.regression_metric import evaluate, forecast_baselines
+from src.utils.ml_utils.metric.regression_metric import (BASELINE_SPECS, evaluate,
+                                                        forecast_baselines)
 from src.utils.ml_utils.model.offset import OffsetModel
 
 MODEL_KINDS = ("ridge", "elasticnet", "hgb")
@@ -63,6 +64,35 @@ def make_model(kind: str, **kw) -> BaseEstimator:
     raise ValueError(f"unknown model kind: {kind}")
 
 
+class BaselineForecaster(BaseEstimator):
+    """A baseline wearing the estimator interface, so the ship decision can be obeyed.
+
+    `ship_decision` can rule that no learned model earned its place. Acting on that
+    verdict means the baseline has to satisfy the same `.predict(X)` contract the
+    bundle, the backtest and the serving path all assume -- otherwise the rule stays
+    a report and the learned model serves anyway.
+
+    There is nothing to fit: every baseline is a closed form over columns the feature
+    matrix already carries, taken from the same `BASELINE_SPECS` that scored it. A
+    shipped baseline therefore cannot behave differently from the one that won.
+    """
+
+    def __init__(self, name: str, signal: str, horizon: int):
+        self.name = name
+        self.signal = signal
+        self.horizon = horizon
+
+    def fit(self, X=None, y=None) -> "BaselineForecaster":
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        d = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        return np.asarray(BASELINE_SPECS[self.name](d, self.signal, self.horizon), float)
+
+    def __repr__(self) -> str:
+        return f"BaselineForecaster({self.name}, {self.signal}, h{self.horizon})"
+
+
 # ------------------------------------------------------------------------------ sweep
 
 def run_sweep(F: pd.DataFrame, features: list, config, params: dict = None, seed: int = SEED):
@@ -85,12 +115,18 @@ def run_sweep(F: pd.DataFrame, features: list, config, params: dict = None, seed
             if len(te) > config.max_eval_rows:
                 te = te.sample(config.max_eval_rows, random_state=seed)
 
-            for name, pred in forecast_baselines(te, signal, h).items():
-                r = evaluate(te[target].values, pred, te[f"{signal}_lag1"].values,
-                             model=name, family="baseline", signal=signal, horizon=h,
-                             split="test")
-                if r:
-                    rows.append(r)
+            # Baselines are scored on val as well as test: a baseline can now be the
+            # thing that ships, and the drift monitor needs its val MAE as the reference
+            # it compares test against.
+            for label, part in (("val", va), ("test", te)):
+                if len(part) < 40:
+                    continue
+                for name, pred in forecast_baselines(part, signal, h).items():
+                    r = evaluate(part[target].values, pred, part[f"{signal}_lag1"].values,
+                                 model=name, family="baseline", signal=signal, horizon=h,
+                                 split=label)
+                    if r:
+                        rows.append(r)
 
             for kind in MODEL_KINDS:
                 mdl = make_model(kind, **params.get((kind, signal), {}))
@@ -220,36 +256,49 @@ class BPPredictor:
     @classmethod
     def build(cls, F, features, config, winner, best_params, offset_model,
               qmodels, qhat, interval_signal, interval_horizon,
-              detector, imputer, dense_cols, detector_cut) -> "BPPredictor":
-        """Refit the forecasters on train+val, then freeze everything into one bundle."""
+              detector, imputer, dense_cols, detector_cut,
+              shipped: dict = None) -> "BPPredictor":
+        """Refit the forecasters on train+val, then freeze everything into one bundle.
+
+        `shipped` maps signal -> ('learned', kind) | ('baseline', name) and is the ship
+        decision made real: a signal whose learned model did not clear the bar serves
+        the baseline that beat it, not the learned model that lost.
+        """
         fit_mask = F.split.isin(["train", "val"])
+        shipped = shipped or {s: ("learned", winner.get(s, "hgb")) for s in config.signals}
 
         forecasters = {}
         for s in config.signals:
-            kind = winner.get(s, "hgb")
+            family, name = shipped.get(s, ("learned", winner.get(s, "hgb")))
             for h in config.horizons:
                 tgt = f"y_{s}_h{h}"
                 if tgt not in F.columns:
+                    continue
+                if family == "baseline":
+                    forecasters[(s, h)] = BaselineForecaster(name, s, h)
                     continue
                 d = F[fit_mask & F[tgt].notna()]
                 if len(d) < 200:
                     continue
                 if len(d) > config.max_train_rows:
                     d = d.sample(config.max_train_rows, random_state=config.seed)
-                forecasters[(s, h)] = make_model(kind, **best_params.get((kind, s), {})).fit(
+                forecasters[(s, h)] = make_model(name, **best_params.get((name, s), {})).fit(
                     d[features], d[tgt].values)
+        logging.info("shipped forecasters: %s",
+                     {s: f"{f}:{n}" for s, (f, n) in shipped.items()})
 
         bundle = dict(
             model_version=f"hemobp-bp-{config.run_id}", run_id=config.run_id,
             config=config, feature_names=features,
-            selected_family=winner, forecasters=forecasters,
+            selected_family=winner, shipped=shipped, forecasters=forecasters,
             interval=dict(models=qmodels, qhat=qhat, signal=interval_signal,
                           horizon=interval_horizon, fit_on="train", calibrated_on="val"),
             offset=dict(warm=offset_model.warm, k=offset_model.k, q=offset_model.q,
                         cohort_prior=offset_model.cohort_prior,
                         global_prior=offset_model.global_prior,
                         label="capped shrinkage blend"),
-            detector=dict(model=detector, imputer=imputer, cols=dense_cols, cut=detector_cut,
+            detector=dict(model=detector, name=getattr(detector, "name", "d_isoforest"),
+                          imputer=imputer, cols=dense_cols, cut=detector_cut,
                           budget_pct=config.alert_budget_pct, warn_window=config.warn_window,
                           event_quantile=config.event_quantile),
         )
@@ -267,6 +316,22 @@ class BPPredictor:
         return cls(joblib.load(path))
 
     # ---------- inference ----------
+    def detector_score(self, F: pd.DataFrame, sbp_history: pd.Series = None) -> np.ndarray:
+        """Model 3 over one or many feature rows -- the only path that scores the detector.
+
+        Serving and the dashboard's trend view both come through here, so the number in
+        the advisory and the number on the chart cannot come from different detectors.
+        The bundle carries a ServingDetector; the fallback covers a bundle frozen before
+        the detector became selectable, which held a bare score_samples estimator.
+        """
+        det = self.b["detector"]
+        model = det.get("model")
+        if hasattr(model, "score") and hasattr(model, "kind"):
+            return np.asarray(model.score(F, sbp_history), float)
+        return -np.asarray(
+            model.score_samples(det["imputer"].transform(F.reindex(columns=det["cols"]))),
+            float)
+
     def _tier(self, n: int) -> str:
         c = self.config
         if n < c.cold_start_min_readings:
@@ -306,6 +371,11 @@ class BPPredictor:
                     p = float(mdl.predict(X)[0])
                 except Exception:
                     continue
+                # A baseline is a closed form over lag columns, so a short history
+                # yields NaN rather than raising. NaN is not valid JSON, so it is
+                # dropped here instead of being serialised into the advisory.
+                if not np.isfinite(p):
+                    continue
                 out["forecast"].setdefault(sig, {})[f"h{h}"] = dict(
                     point=round(p, 1), steps_ahead=h, days_ahead_est=round(h * med_gap, 1))
 
@@ -319,11 +389,13 @@ class BPPredictor:
                                            f"conformal on {iv['calibrated_on']}")
 
             det = b["detector"]
-            score = float(-det["model"].score_samples(
-                det["imputer"].transform(row.reindex(columns=det["cols"])))[0])
+            score = float(np.ravel(self.detector_score(row, g.sbp))[0])
             out["early_warning"] = dict(
-                score=round(score, 4), cut=round(det["cut"], 4),
-                flagged=bool(score >= det["cut"]), budget_pct=det["budget_pct"],
+                detector=det.get("name", "d_isoforest"),
+                score=(round(score, 4) if np.isfinite(score) else None),
+                cut=round(det["cut"], 4),
+                flagged=bool(np.isfinite(score) and score >= det["cut"]),
+                budget_pct=det["budget_pct"],
                 event_definition=(f"SBP exceeds this patient's own p"
                                   f"{int(det['event_quantile'] * 100)} within the next "
                                   f"{det['warn_window']} sessions"),

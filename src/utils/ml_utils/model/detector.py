@@ -260,6 +260,155 @@ def widen_detector_set(D: pd.DataFrame, X_train, X_all, features: list,
     return new
 
 
+# ------------------------------------------------------------------- serving
+
+# Closed forms over columns the feature matrix already carries, identical to the
+# definitions in `EarlyWarningDataset.build` and `widen_detector_set`.
+_COLUMN_SCORERS = {
+    "d_personal_z": lambda F: F["sbp_z"].abs().to_numpy(float),
+    "d_mean7_excess": lambda F: (F["sbp_mean7"] - F["sbp_base_mean"]).to_numpy(float),
+    "d_slope7": lambda F: F["sbp_slope7"].to_numpy(float),
+    "d_fixed_threshold": lambda F: F["sbp_lag1"].to_numpy(float),
+}
+_FORECAST_SCORERS = ("d_forecast_breach", "d_forecast_level")
+_MODEL_SCORERS = ("d_isoforest", "d_lof", "d_elliptic", "d_ocsvm", "d_gmm_nll")
+
+# Fusion legs and the sequential statistics are deliberately absent: fusion needs every
+# leg plus TRAIN normalisation constants, and CUSUM / Page-Hinkley are running states
+# over a patient's whole series. Neither survives being frozen into a bundle honestly,
+# so they are scored and reported but never selected to serve.
+SERVEABLE_DETECTORS = tuple(_COLUMN_SCORERS) + _FORECAST_SCORERS + _MODEL_SCORERS
+
+
+class ServingDetector:
+    """The detector the scorecard actually chose, in a form the bundle can evaluate.
+
+    The bundle previously carried a bare `score_samples` estimator, so an IsolationForest
+    was the only thing it could hold -- and it shipped regardless of where the scorecard
+    ranked it. The top detectors are forecast-relative rather than model-based: they ask
+    "is this patient heading above their OWN band", which is the question the early
+    warning is for, and no population outlier model can answer it.
+
+    `sbp_history` supplies the per-patient reference. At training that reference is fitted
+    on the train split; at serving the patient's own past readings are the analogue, and
+    they are all causal.
+    """
+
+    def __init__(self, name: str, kind: str, model=None, imputer=None, cols=None,
+                 forecaster=None, feature_names=None, event_quantile: float = 0.95):
+        self.name = name
+        self.kind = kind
+        self.model = model
+        self.imputer = imputer
+        self.cols = cols
+        self.forecaster = forecaster
+        self.feature_names = feature_names
+        self.event_quantile = event_quantile
+
+    def _reference(self, F: pd.DataFrame, sbp_history):
+        """Per-row (band, mean, sd) for the patient each row belongs to.
+
+        `sbp_history` is the single-patient serving case. Without it the reference is
+        taken per `series_id`, which is what a multi-patient frame needs: pooling every
+        patient's readings into one band would turn a personal reference into a
+        population one, and calibrating the cut that way would not match serving.
+
+        The band is FIXED per patient rather than expanding, which is how training
+        defines it (`event_threshold` is one value per patient) and therefore how the
+        cut was calibrated. An expanding band was tried and rejected: it is more causal
+        per step, but it estimates the band from very few readings early in a series, so
+        the scores it produces are not on the scale the cut was fitted to and it flags
+        more sessions than the budget allows. A chart drawn from it would show alerts
+        the operating point does not actually authorise.
+        """
+        n = len(F)
+        if sbp_history is not None:
+            h = pd.Series(sbp_history).dropna()
+            if not len(h):
+                return (np.full(n, np.nan),) * 3
+            return (np.full(n, h.quantile(self.event_quantile)),
+                    np.full(n, h.mean()),
+                    np.full(n, h.std() if len(h) > 1 else np.nan))
+        if "series_id" not in F.columns or "sbp" not in F.columns:
+            return (np.full(n, np.nan),) * 3
+        g = F.groupby("series_id").sbp
+        return (F.series_id.map(g.quantile(self.event_quantile)).to_numpy(float),
+                F.series_id.map(g.mean()).to_numpy(float),
+                F.series_id.map(g.std()).to_numpy(float))
+
+    def score(self, F: pd.DataFrame, sbp_history: pd.Series = None) -> np.ndarray:
+        if self.kind == "column":
+            return _COLUMN_SCORERS[self.name](F)
+
+        if self.kind == "forecast":
+            # reindex, not [...]: the inference row is built by a different code path
+            # from the training frame, and a missing column must become NaN rather than
+            # a KeyError that silently disables the detector.
+            pred = np.asarray(
+                self.forecaster.predict(F.reindex(columns=self.feature_names)), float)
+            thr, mu, sd = self._reference(F, sbp_history)
+            if self.name == "d_forecast_breach":
+                return pred - thr
+            sd = np.where(np.isfinite(sd) & (sd > 0), sd, np.nan)
+            return (pred - mu) / sd
+
+        X = self.imputer.transform(F.reindex(columns=self.cols))
+        if hasattr(self.model, "score_samples"):
+            return -np.asarray(self.model.score_samples(X), float)
+        if hasattr(self.model, "decision_function"):
+            return -np.asarray(self.model.decision_function(X), float)
+        return np.asarray(self.model.mahalanobis(X), float)
+
+
+def choose_serving_detector(det_report: pd.DataFrame, budget_pct: float,
+                            fallback: str = "d_isoforest") -> str:
+    """Highest-precision detector the bundle can actually serve, at the alert budget.
+
+    Precision is the operating-point metric: the budget fixes the alert count, so this
+    is the share of those alerts that are real. Anything unserveable is skipped here
+    rather than silently ranked and then quietly replaced at bundle time.
+    """
+    if det_report is None or not len(det_report):
+        return fallback
+    d = det_report[det_report.budget_pct == budget_pct]
+    d = d[d.detector.isin(SERVEABLE_DETECTORS)]
+    if not len(d):
+        return fallback
+    d = d.sort_values(["precision", "auc_pr"], ascending=False)
+    return str(d.detector.iloc[0])
+
+
+def build_serving_detector(name: str, D: pd.DataFrame, imputer, dense_cols: list,
+                           features: list, forecaster, config) -> ServingDetector:
+    """Fit (or wrap) the chosen detector on train+val, ready to freeze into the bundle."""
+    if name in _COLUMN_SCORERS:
+        return ServingDetector(name, "column")
+    if name in _FORECAST_SCORERS:
+        if forecaster is None:
+            logging.warning("%s chosen but no forecaster available; falling back", name)
+            return build_serving_detector("d_isoforest", D, imputer, dense_cols,
+                                          features, None, config)
+        return ServingDetector(name, "forecast", forecaster=forecaster,
+                               feature_names=features,
+                               event_quantile=config.event_quantile)
+
+    fit_rows = D[D.split.isin(["train", "val"])]
+    X = imputer.transform(fit_rows[dense_cols])
+    if name == "d_lof":
+        model = LocalOutlierFactor(n_neighbors=25, novelty=True).fit(X)
+    elif name == "d_elliptic":
+        model = EllipticEnvelope(support_fraction=.9, random_state=SEED).fit(X)
+    elif name == "d_ocsvm":
+        sub = X[np.random.default_rng(SEED).permutation(len(X))[:4000]]
+        model = OneClassSVM(nu=.05, gamma="scale").fit(sub)
+    elif name == "d_gmm_nll":
+        model = GaussianMixture(n_components=4, covariance_type="diag",
+                                random_state=SEED, reg_covar=1e-4).fit(X)
+    else:
+        model = IsolationForest(n_estimators=200, random_state=SEED, n_jobs=2).fit(X)
+    return ServingDetector(name, "model", model=model, imputer=imputer, cols=dense_cols)
+
+
 def fuse_detectors(D: pd.DataFrame, detectors: list) -> list:
     """Normalise on TRAIN only, then combine the diverse legs.
 

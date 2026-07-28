@@ -55,16 +55,25 @@ def evaluate(y, p, last=None, lo=None, hi=None, **meta) -> dict:
     return out
 
 
+# Each baseline as a closed form over columns the feature matrix already carries. This is
+# the single definition: `forecast_baselines` scores them and `BaselineForecaster` serves
+# them, so a baseline that wins the ship decision cannot behave differently once shipped.
+BASELINE_SPECS = {
+    "persistence": lambda d, s, h: d[f"{s}_lag1"].to_numpy(float),
+    "seasonal_naive_7": lambda d, s, h: (d[f"{s}_lag7"].to_numpy(float)
+                                         if f"{s}_lag7" in d
+                                         else np.full(len(d), np.nan)),
+    "drift": lambda d, s, h: (d[f"{s}_lag1"].to_numpy(float)
+                              + h * (d[f"{s}_lag1"].to_numpy(float)
+                                     - d[f"{s}_lag2"].to_numpy(float))),
+    "personal_mean": lambda d, s, h: d[f"{s}_base_mean"].to_numpy(float),
+    "ewma": lambda d, s, h: d[f"{s}_ewm0.3"].to_numpy(float),
+}
+
+
 def forecast_baselines(df: pd.DataFrame, signal: str, h: int) -> dict:
     """The floor every learned model must clear, per signal and horizon."""
-    last = df[f"{signal}_lag1"].values
-    return {
-        "persistence": last,
-        "seasonal_naive_7": df.get(f"{signal}_lag7", pd.Series(np.nan, index=df.index)).values,
-        "drift": last + h * (df[f"{signal}_lag1"].values - df[f"{signal}_lag2"].values),
-        "personal_mean": df[f"{signal}_base_mean"].values,
-        "ewma": df[f"{signal}_ewm0.3"].values,
-    }
+    return {name: fn(df, signal, h) for name, fn in BASELINE_SPECS.items()}
 
 
 def ship_decision(learned_mae: float, baseline_mae: float, ci_width: float):
@@ -116,7 +125,14 @@ def get_forecast_score(row: dict) -> ForecastMetricArtifact:
 
 
 def select_and_decide(R: pd.DataFrame, config):
-    """Select on validation MAE, then apply the ship rule on test."""
+    """Select on validation MAE, then apply the ship rule on test.
+
+    Both sides of the comparison are averaged over the SAME horizons. Scoring the
+    learned model across h1..h3 against the single best baseline cell -- which is
+    always h1, because MAE grows with horizon -- makes the learned model answer for
+    the hard horizons while the baseline is credited only with the easy one, and
+    understates the gain by roughly the h1-to-h3 spread.
+    """
     try:
         val = (R[(R.split == "val") & (R.family == "learned")]
                .groupby(["signal", "model"]).MAE.mean().unstack())
@@ -127,18 +143,41 @@ def select_and_decide(R: pd.DataFrame, config):
         test = R[R.split == "test"]
         rows = []
         for s in val.index:
-            base = test[(test.signal == s) & (test.family == "baseline")]
-            best_base = base.loc[base.MAE.idxmin()] if len(base) else None
             sel = test[(test.signal == s) & (test.model == winner[s])]
-            if best_base is None or not len(sel):
+            base = test[(test.signal == s) & (test.family == "baseline")]
+            if not len(sel) or not len(base):
                 continue
+            horizons = sorted(set(sel.horizon))
+            base = base[base.horizon.isin(horizons)]
+            # mean per baseline over the horizons the learned model is answering for
+            per_base = base.groupby("model").MAE.mean()
+            covers = base.groupby("model").horizon.nunique() == len(horizons)
+            per_base = per_base[covers[covers].index] if covers.any() else per_base
+            if per_base.empty:
+                continue
+            best_name = per_base.idxmin()
             learned_mae = float(sel.MAE.mean())
             ci_w = float(sel.MAE_hi.mean() - sel.MAE_lo.mean())
-            verdict, gain = ship_decision(learned_mae, float(best_base.MAE), ci_w)
+            verdict, gain = ship_decision(learned_mae, float(per_base.min()), ci_w)
             rows.append(dict(signal=s, selected=winner[s], learned_MAE=round(learned_mae, 3),
-                             best_baseline=best_base.model,
-                             baseline_MAE=round(float(best_base.MAE), 3),
-                             gain_mmHg=round(gain, 3), CI_width=round(ci_w, 3), ship=verdict))
+                             best_baseline=best_name,
+                             baseline_MAE=round(float(per_base.min()), 3),
+                             gain_mmHg=round(gain, 3), CI_width=round(ci_w, 3),
+                             horizons=len(horizons), ship=verdict))
         return winner, pd.DataFrame(rows)
     except Exception as e:
         raise CustomException(e, sys)
+
+
+def shipped_forecasters(decision: pd.DataFrame, winner: dict) -> dict:
+    """signal -> ('learned', kind) or ('baseline', name), honouring the ship decision.
+
+    Without this the verdict is a report nobody reads: `build` froze the learned winner
+    whatever the rule said, so a model that never cleared the bar still served every
+    request.
+    """
+    out = {s: ("learned", k) for s, k in winner.items()}
+    for r in decision.itertuples() if len(decision) else []:
+        if str(r.ship).upper() == "BASELINE":
+            out[r.signal] = ("baseline", r.best_baseline)
+    return out

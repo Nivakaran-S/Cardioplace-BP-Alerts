@@ -53,18 +53,41 @@ def detector_scorecard(df: pd.DataFrame, detectors: list, sessions_per_week: flo
 
 # ----------------------------------------------------------------------------- offset
 
-def offset_scorecard(M: pd.DataFrame, label: str, population_threshold: float) -> pd.DataFrame:
-    """Learned blend vs personal-only, cohort-only and the population constant."""
+def offset_scorecard(M: pd.DataFrame, label: str, population_threshold: float,
+                     config=None) -> pd.DataFrame:
+    """Learned blend vs personal-only, cohort-only and the population constant.
+
+    Every candidate is put through the same governance caps before it is scored. Raw
+    personal and cohort bands are not shippable alternatives: on this cohort the raw
+    personal band reaches 195 mmHg and would hand 24 of 150 patients a threshold at or
+    above the 180 emergency floor, which safety gate 3 exists to forbid. Scoring the
+    capped blend against an uncapped rival measures the cost of the cap and calls it a
+    modelling loss -- and the ship decision downstream then rules against the only legal
+    option. The caps are applied here so the comparison is between things that could
+    actually ship; `legal_raw` records which candidates were already compliant.
+    """
+    a = M.actual.values
+
+    def cap(v):
+        v = np.asarray(v, float)
+        if config is None:
+            return v
+        return population_threshold + np.clip(v - population_threshold,
+                                              -config.offset_cap_tighten,
+                                              config.offset_cap_loosen)
+
     candidates = {"learned (capped blend)": M.threshold.values,
                   "personal only": M.personal.values,
                   "cohort only": M.cohort.values,
                   "population constant": np.full(len(M), population_threshold)}
     rows = []
-    for name, p in candidates.items():
-        mae, (lo, hi) = bootstrap_ci(mean_absolute_error, M.actual.values, p)
+    for name, raw in candidates.items():
+        p = cap(raw)
+        mae, (lo, hi) = bootstrap_ci(mean_absolute_error, a, p)
         rows.append(dict(split=label, model=name, MAE=round(mae, 2), lo=round(lo, 2),
-                         hi=round(hi, 2), R2=round(r2_score(M.actual.values, p), 3),
-                         within_10mmHg=round(float(np.mean(np.abs(M.actual.values - p) <= 10)), 3)))
+                         hi=round(hi, 2), R2=round(r2_score(a, p), 3),
+                         within_10mmHg=round(float(np.mean(np.abs(a - p) <= 10)), 3),
+                         legal_raw=bool(np.allclose(np.asarray(raw, float), p, equal_nan=True))))
     return pd.DataFrame(rows)
 
 

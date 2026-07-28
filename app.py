@@ -302,17 +302,26 @@ def _feature_frame(predictor: BPPredictor, history: pd.DataFrame) -> pd.DataFram
 
 
 def _anomaly_series(predictor: BPPredictor, F: pd.DataFrame) -> dict:
-    """Model 3 across the whole history, so drift toward the cut is visible."""
+    """Model 3 across the whole history, so drift toward the cut is visible.
+
+    Routed through the predictor's own scorer, so the chart and the advisory can never
+    show two different detectors. This is a retrospective view: every session is scored
+    against the patient's overall band, which is the same quantity the cut was
+    calibrated against, so a point above the line means what the cut says it means.
+    """
     det = predictor.b["detector"]
-    X = det["imputer"].transform(F.reindex(columns=det["cols"]))
-    scores = -det["model"].score_samples(X)
+    scores = np.asarray(predictor.detector_score(F, F.sbp), float)
     cut = float(det["cut"])
     warm = predictor.config.cold_start_min_readings
-    points = [{"ts": t.strftime("%Y-%m-%d"), "score": round(float(s), 4),
-               "flagged": bool(s >= cut), "warmup": i < warm}
+    # Early sessions have no rolling window yet, so a column-based detector scores NaN
+    # there. NaN is not valid JSON; those points carry a null score and never flag.
+    points = [{"ts": t.strftime("%Y-%m-%d"),
+               "score": (round(float(s), 4) if np.isfinite(s) else None),
+               "flagged": bool(np.isfinite(s) and s >= cut), "warmup": i < warm}
               for i, (t, s) in enumerate(zip(F.ts, scores))]
-    settled = [p for p in points if not p["warmup"]]
-    return {"points": points, "cut": round(cut, 4), "budget_pct": det["budget_pct"],
+    settled = [p for p in points if not p["warmup"] and p["score"] is not None]
+    return {"points": points, "detector": det.get("name", "d_isoforest"),
+            "cut": round(cut, 4), "budget_pct": det["budget_pct"],
             "n_flagged": sum(1 for p in settled if p["flagged"]),
             "n_settled": len(settled), "warmup_sessions": len(points) - len(settled),
             "event_definition": (f"SBP exceeds this patient's own p"
@@ -463,6 +472,11 @@ def model_info():
     return {
         "model_version": b.get("model_version"), "run_id": b.get("run_id"),
         "source": STORE.source, "selected_family": b.get("selected_family"),
+        # What the ship decision actually sent to production, which is not always the
+        # learned winner -- `selected_family` is only the best of the learned candidates.
+        "shipped": {s: f"{fam}:{name}"
+                    for s, (fam, name) in (b.get("shipped") or {}).items()},
+        "detector": b.get("detector", {}).get("name"),
         "n_features": len(b.get("feature_names", [])),
         "forecast_horizons": sorted({h for _, h in b.get("forecasters", {}).keys()}),
         "forecast_signals": sorted({s for s, _ in b.get("forecasters", {}).keys()}),
@@ -492,6 +506,10 @@ def predict(req: PredictRequest):
     advisory["history"] = [
         {"ts": r.ts.strftime("%Y-%m-%d"), "sbp": float(r.sbp), "dbp": float(r.dbp)}
         for r in history.itertuples()]
+    # What the ship decision sent to production, per signal. A reader should not have to
+    # assume a learned model produced the numbers on the page.
+    advisory["shipped"] = {s: f"{fam}:{name}" for s, (fam, name)
+                           in (predictor.b.get("shipped") or {}).items()}
 
     # Model 3 across the whole history, plus the backtest -- one feature build for both.
     try:
@@ -886,8 +904,11 @@ def _render_dashboard(a: dict) -> str:
                  f"threshold {pers.get('threshold')}"),
                 (a.get("emergency_floor_mmHg"), S["critical"],
                  f"floor {a.get('emergency_floor_mmHg')}")]
+        shipped_sbp = (a.get("shipped") or {}).get("sbp")
         h.append('<div class="pnl"><h3>Model 1 — forecaster</h3>'
-                 '<p class="hint">Observed SBP and the forecast, per session</p>'
+                 '<p class="hint">Observed SBP and the forecast, per session'
+                 + (f' · serving <b>{_esc(shipped_sbp)}</b>' if shipped_sbp else "")
+                 + "</p>"
                  + _legend([(C["s1"], "Observed"), (C["s2"], "Forecast"),
                             (S["warning"], "Threshold"), (S["critical"], "Floor")])
                  + '<div class="sc">'
@@ -939,15 +960,18 @@ def _render_dashboard(a: dict) -> str:
 
     # ---- Model 3: anomaly ----
     an = a.get("anomaly") or {}
-    if an.get("points") and len(an["points"]) >= 2:
+    scored = [p for p in (an.get("points") or []) if p["score"] is not None]
+    if scored and len(an["points"]) >= 2:
         pts = an["points"]
-        scores = [p["score"] for p in pts]
+        scores = [p["score"] for p in pts]     # None leaves a gap in the line
         marks = [(i, S["critical"]) for i, p in enumerate(pts) if p["flagged"]]
         xl = [(0, pts[0]["ts"][5:]), (len(pts) // 2, pts[len(pts) // 2]["ts"][5:]),
               (len(pts) - 1, pts[-1]["ts"][5:])]
-        peak = max(pts, key=lambda p: p["score"])
+        peak = max(scored, key=lambda p: p["score"])
         h.append('<div class="pnl"><h3>Model 3 — early-warning detector</h3>'
-                 f'<p class="hint">{_esc(an["event_definition"])}</p>'
+                 f'<p class="hint">{_esc(an["event_definition"])}'
+                 + (f' · scorer <b>{_esc(an.get("detector"))}</b>'
+                    if an.get("detector") else "") + "</p>"
                  + _legend([(C["s1"], "Detector score"), (S["warning"], "Alert cut"),
                             (S["critical"], "Flagged")])
                  + '<div class="sc">'

@@ -3,7 +3,6 @@ import sys
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
 from sklearn.metrics import mean_absolute_error
 
 from src.entity.artifact_entity import (DataTransformationArtifact, DetectorMetricArtifact,
@@ -16,7 +15,7 @@ from src.logging.logger import logging, timer
 from src.utils.main_utils.utils import (load_dataframe, read_yaml_file, save_object,
                                         save_report, write_yaml_file)
 from src.utils.ml_utils.metric.regression_metric import (get_forecast_score, select_and_decide,
-                                                         ship_decision)
+                                                         ship_decision, shipped_forecasters)
 from src.utils.ml_utils.metric.timeseries_metric import (FAIR_MARGIN_PP, DriftMonitor,
                                                          decision_curve, detector_scorecard,
                                                          elicitation_table, offset_scorecard,
@@ -24,11 +23,13 @@ from src.utils.ml_utils.metric.timeseries_metric import (FAIR_MARGIN_PP, DriftMo
 from src.utils.ml_utils.model.classifier_head import build_classifier_frame, train_tier_head
 from src.utils.ml_utils.model.detector import (BASE_DETECTORS, DETECTOR_FAMILY,
                                                EarlyWarningDataset, build_score_matrix,
+                                               build_serving_detector, choose_serving_detector,
                                                fit_default_detectors, fuse_detectors,
                                                tune_detectors, widen_detector_set)
-from src.utils.ml_utils.model.estimator import (BPPredictor, MODEL_KINDS, champion_challenger,
-                                                explain_prediction, fit_quantile_interval,
-                                                make_model, random_search, run_sweep)
+from src.utils.ml_utils.model.estimator import (BPPredictor, MODEL_KINDS, BaselineForecaster,
+                                                champion_challenger, explain_prediction,
+                                                fit_quantile_interval, make_model,
+                                                random_search, run_sweep)
 from src.utils.ml_utils.model.offset import observed_band, search_offset
 from src.utils.ml_utils.rule_engine.advisory import arbitrate, build_advisories
 from src.utils.ml_utils.rule_engine.engine import RuleEngine
@@ -138,7 +139,7 @@ class ModelTrainer:
         return cmp.round(3).reset_index()
 
     # ------------------------------------------------------------------ detector
-    def train_detectors(self, F, features, config, winner):
+    def train_detectors(self, F, features, config, winner, shipped=None):
         with timer("early-warning dataset"):
             ew = EarlyWarningDataset(config)
             D = ew.build(F, features)
@@ -147,17 +148,25 @@ class ModelTrainer:
         D = fit_default_detectors(D, X_train, X_all)
         best_detector = tune_detectors(D, imputer, dense_cols, X_train, X_all)
 
-        # The forecast-based detectors reuse Part 6's winner; they are the ones most likely
-        # to win, so they are wired in rather than left as a note.
+        # The forecast-based detectors reuse Part 6's forecaster. It has to be the one
+        # that SHIPS, not the learned winner: if the ship decision sent a baseline to
+        # production, scoring these detectors against a learned forecaster would rank
+        # them on a model no request will ever see.
         forecaster, fc_target = None, f"y_sbp_h{config.horizons[0]}"
+        family, name = (shipped or {}).get("sbp", ("learned", winner.get("sbp",
+                                                                         MODEL_KINDS[-1])))
         try:
-            kind = winner.get("sbp", MODEL_KINDS[-1])
-            fit_rows = D[(D.split == "train") & D[fc_target].notna()]
-            if len(fit_rows) > 200:
-                if len(fit_rows) > config.max_train_rows:
-                    fit_rows = fit_rows.sample(config.max_train_rows, random_state=config.seed)
-                forecaster = make_model(kind, **self.best_params.get((kind, "sbp"), {})).fit(
-                    fit_rows[features], fit_rows[fc_target])
+            if family == "baseline":
+                forecaster = BaselineForecaster(name, "sbp", config.horizons[0])
+            else:
+                fit_rows = D[(D.split == "train") & D[fc_target].notna()]
+                if len(fit_rows) > 200:
+                    if len(fit_rows) > config.max_train_rows:
+                        fit_rows = fit_rows.sample(config.max_train_rows,
+                                                   random_state=config.seed)
+                    forecaster = make_model(
+                        name, **self.best_params.get((name, "sbp"), {})).fit(
+                        fit_rows[features], fit_rows[fc_target])
         except Exception as exc:
             logging.warning("forecast-residual detector unavailable: %s", exc)
 
@@ -173,10 +182,15 @@ class ModelTrainer:
         D_val = D[(D.split == "val") & D.event_next.notna()]
         sessions_per_week = 7.0 / max(float(D.days_since_last.median()), 1e-9)
         det_report = detector_scorecard(D_test, detectors, sessions_per_week)
-        if len(det_report):
-            det_report["family"] = det_report.detector.map(DETECTOR_FAMILY).fillna("?")
-        return (D, D_val, D_test, detectors, det_report, imputer, dense_cols,
-                best_detector, sessions_per_week)
+        # Selection reads the VAL scorecard; test is kept for reporting only. Choosing
+        # which detector ships by its test score would make the reported test number an
+        # estimate of the winner's luck rather than of its performance.
+        det_report_val = detector_scorecard(D_val, detectors, sessions_per_week)
+        for rep in (det_report, det_report_val):
+            if len(rep):
+                rep["family"] = rep.detector.map(DETECTOR_FAMILY).fillna("?")
+        return (D, D_val, D_test, detectors, det_report, det_report_val, imputer,
+                dense_cols, best_detector, forecaster, sessions_per_week)
 
     # ------------------------------------------------------------------ orchestration
     def initiate_model_trainer(self) -> ModelTrainerArtifact:
@@ -205,6 +219,11 @@ class ModelTrainer:
                 save_report(config.report_path("tuning_default_vs_tuned.csv"), tune_cmp)
             if len(decision):
                 save_report(config.report_path("ship_decision.csv"), decision)
+            # The verdict decides what serves, here and downstream. A signal whose
+            # learned model did not clear the bar ships the baseline that beat it.
+            shipped = shipped_forecasters(decision, winner)
+            logging.info("ship decision applied: %s",
+                         {s: f"{f}:{n}" for s, (f, n) in shipped.items()})
 
             # ---- 2. prediction intervals --------------------------------------
             interval_signal = "sbp"
@@ -226,34 +245,53 @@ class ModelTrainer:
             if len(M_hold) >= 10:
                 off_report = pd.concat([
                     offset_scorecard(M_hold, "held-out patients",
-                                     config.population_threshold_mmHg),
+                                     config.population_threshold_mmHg, config),
                     offset_scorecard(M_all, "all patients",
-                                     config.population_threshold_mmHg)]).sort_values(
+                                     config.population_threshold_mmHg, config)]).sort_values(
                     ["split", "MAE"])
                 save_report(config.report_path("offset_scorecard.csv"), off_report)
                 h_ = off_report[off_report.split == "held-out patients"]
                 learned = float(h_[h_.model == "learned (capped blend)"].MAE.iloc[0])
-                base = float(h_[h_.model != "learned (capped blend)"].MAE.min())
+                alts = h_[h_.model != "learned (capped blend)"]
+                base = float(alts.MAE.min())
+                alt_name = str(alts.loc[alts.MAE.idxmin()].model)
                 ci_w = float(h_[h_.model == "learned (capped blend)"].eval("hi - lo").iloc[0])
                 verdict, gain = ship_decision(learned, base, ci_w)
-                logging.info("offset decision -> %s (gain %+.2f mmHg vs best baseline)",
-                             verdict, gain)
+                logging.info("offset decision -> %s (gain %+.2f mmHg vs %s, CI width %.2f)",
+                             verdict, gain, alt_name, ci_w)
+                # Unlike the forecaster, the blend is NOT auto-replaced on a BASELINE
+                # verdict. Once the governance caps are applied to every candidate the
+                # alternatives collapse to constants -- capped cohort-only is 155 mmHg
+                # for every patient -- so acting on the verdict would delete
+                # personalisation rather than simplify it. The blend is the best point
+                # estimate and the only candidate that varies per patient; the verdict
+                # is recorded here as "not proven better", which is what it means.
+                if verdict != "learned model":
+                    logging.info("offset retained: alternatives are constants under the "
+                                 "caps (%s = one threshold for every patient), so the "
+                                 "verdict records 'not proven better', not 'replace'",
+                                 alt_name)
                 offset_artifact = OffsetMetricArtifact(
                     label="capped shrinkage blend", warm=offset_model.warm,
                     k=offset_model.k, q=offset_model.q, n_patients=len(M_hold),
                     mae=round(learned, 3),
                     max_threshold=float(OFF.threshold.max()),
                     emergency_floor=config.emergency_floor_mmHg,
-                    n_capped=int(OFF.capped.sum()))
+                    n_capped=int(OFF.capped.sum()),
+                    ship=verdict, best_legal_alternative=alt_name,
+                    gain_mmHg=round(gain, 3))
             if len(offset_search):
                 save_report(config.report_path("offset_search.csv"), offset_search)
 
             # ---- 4. early-warning detectors -----------------------------------
             with timer("detector training"):
-                (D, D_val, D_test, detectors, det_report, imputer, dense_cols,
-                 best_detector, sessions_per_week) = self.train_detectors(
-                    F, features, config, winner)
+                (D, D_val, D_test, detectors, det_report, det_report_val, imputer,
+                 dense_cols, best_detector, det_forecaster,
+                 sessions_per_week) = self.train_detectors(
+                    F, features, config, winner, shipped)
             detector_artifacts = []
+            if len(det_report_val):
+                save_report(config.report_path("detector_scorecard_val.csv"), det_report_val)
             if len(det_report):
                 save_report(config.report_path("detector_scorecard.csv"), det_report)
                 at_budget = det_report[det_report.budget_pct == config.alert_budget_pct]
@@ -333,19 +371,29 @@ class ModelTrainer:
                             elicitation_table(y_f, p_f, sessions_per_week))
 
             # ---- 9. serving bundle ----------------------------------------------
-            det_params = (best_detector.get("isolation_forest", {}) or {}).get("params") or {}
-            fit_mask = F.split.isin(["train", "val"])
-            det = IsolationForest(random_state=config.seed, n_jobs=2, **det_params).fit(
-                imputer.transform(F[fit_mask][dense_cols]))
-            val_scores = -det.score_samples(imputer.transform(D_val[dense_cols])) \
-                if len(D_val) else np.array([0.0])
+            # Previously an IsolationForest was hardcoded here whatever the scorecard
+            # said -- on this cohort it ranks 18th of 20, below the rule-engine
+            # reference it is supposed to improve on. The scorecard now decides.
+            det_name = choose_serving_detector(det_report_val, config.alert_budget_pct)
+            det = build_serving_detector(det_name, D, imputer, dense_cols, features,
+                                         det_forecaster, config)
+            logging.info("serving detector: %s (selected on val at the %.0f%% budget)",
+                         det_name, config.alert_budget_pct)
+            # No sbp_history argument: D_val holds many patients, so the reference band
+            # must be taken per series_id. Passing the pooled column would calibrate the
+            # cut against a population band the serving path never uses.
+            val_scores = (det.score(D_val) if len(D_val) else np.array([0.0]))
+            val_scores = np.asarray(val_scores, float)
+            val_scores = val_scores[np.isfinite(val_scores)]
+            if not len(val_scores):
+                val_scores = np.array([0.0])
             det_cut = float(np.percentile(val_scores, 100 - config.alert_budget_pct))
 
             with timer("freeze serving artifacts"):
                 predictor = BPPredictor.build(
                     F, features, config, winner, self.best_params, offset_model,
                     qmodels, qhat, interval_signal, interval_horizon,
-                    det, imputer, dense_cols, det_cut)
+                    det, imputer, dense_cols, det_cut, shipped)
             os.makedirs(os.path.dirname(config.bundle_file_path), exist_ok=True)
             predictor.save(config.bundle_file_path)
             logging.info("bundle %s (%.1f MB) | model_version %s",
@@ -355,7 +403,7 @@ class ModelTrainer:
 
             # ---- 10. fairness ----------------------------------------------------
             fairness = self.run_fairness(F, features, config, winner, M_hold,
-                                         D_test, det_report)
+                                         D_test, det_report, shipped)
             if len(fairness):
                 save_report(config.report_path("fairness.csv"), fairness)
 
@@ -422,7 +470,7 @@ class ModelTrainer:
                 promotable=bool(gates.promotable))
 
             # ---- 14. monitoring and champion/challenger ----------------------------
-            self.run_monitoring(F, features, config, R, winner, det_report)
+            self.run_monitoring(F, features, config, R, winner, det_report, shipped)
             chall = champion_challenger(F, features, config,
                                         winner.get("sbp", "ridge"), "hgb")
             if len(chall):
@@ -477,8 +525,13 @@ class ModelTrainer:
             raise CustomException(e, sys)
 
     # ------------------------------------------------------------------ fairness
-    def run_fairness(self, F, features, config, winner, M_hold, D_test, det_report):
-        """Subgroup performance for the forecaster, the offset and the best detector."""
+    def run_fairness(self, F, features, config, winner, M_hold, D_test, det_report,
+                     shipped=None):
+        """Subgroup performance for the forecaster, the offset and the best detector.
+
+        Audits whatever SHIPS. Auditing a learned model that lost the ship decision
+        would clear a subgroup gate for something no patient is ever scored by.
+        """
         try:
             frames = []
             target = f"y_sbp_h{config.horizons[0]}"
@@ -487,9 +540,13 @@ class ModelTrainer:
             if len(tr_f) > 200:
                 tr_f = tr_f.sample(min(config.max_train_rows, len(tr_f)),
                                    random_state=config.seed)
-                kind = winner.get("sbp", "hgb")
-                m = make_model(kind, **self.best_params.get((kind, "sbp"), {})).fit(
-                    tr_f[features], tr_f[target].values)
+                family, kind = (shipped or {}).get("sbp", ("learned",
+                                                           winner.get("sbp", "hgb")))
+                if family == "baseline":
+                    m = BaselineForecaster(kind, "sbp", config.horizons[0])
+                else:
+                    m = make_model(kind, **self.best_params.get((kind, "sbp"), {})).fit(
+                        tr_f[features], tr_f[target].values)
                 te_f = df_f[df_f.split == "test"].copy()
                 if len(te_f) > 40:
                     te_f["pred"] = m.predict(te_f[features])
@@ -537,8 +594,12 @@ class ModelTrainer:
             raise CustomException(e, sys)
 
     # ------------------------------------------------------------------ monitoring
-    def run_monitoring(self, F, features, config, R, winner, det_report):
-        """PSI on features plus error and alert-rate drift, with the response ladder."""
+    def run_monitoring(self, F, features, config, R, winner, det_report, shipped=None):
+        """PSI on features plus error and alert-rate drift, with the response ladder.
+
+        Tracks the model that ships, so the val->test error drift is measured on the
+        thing in production rather than on a learned model that lost the ship decision.
+        """
         try:
             ref, cur = F[F.split == "train"], F[F.split == "test"]
             mon = DriftMonitor(ref, features)
@@ -546,7 +607,7 @@ class ModelTrainer:
             if len(psi):
                 save_report(config.report_path("feature_drift_psi.csv"), psi)
 
-            sel = winner.get("sbp")
+            sel = (shipped or {}).get("sbp", ("learned", winner.get("sbp")))[1]
             ref_mae = float(R[(R.split == "val") & (R.signal == "sbp")
                               & (R.model == sel)].MAE.mean())
             cur_mae = float(R[(R.split == "test") & (R.signal == "sbp")

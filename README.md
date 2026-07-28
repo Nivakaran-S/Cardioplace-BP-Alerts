@@ -34,6 +34,22 @@ Three models plus a deterministic floor:
 | Model 2 — personalisation offset | A capped shrinkage blend of the patient's own band and a demographic cohort prior. |
 | Model 3 — early warning | Detects that SBP will exceed the patient's own p95 within the next 3 sessions. |
 
+### What actually ships
+
+Every one of those layers is chosen by an evaluation, and the evaluation is **binding**:
+
+- **Model 1** ships a learned model only if `(baseline MAE − learned MAE) > bootstrap CI
+  width`, compared over the same horizons. On the current cohort no learned family clears
+  that bar for any signal, so all three signals serve the **EWMA baseline**. `GET
+  /api/model` reports what shipped per signal; the dashboard prints it on the chart.
+- **Model 3** ships the highest-precision detector the bundle can evaluate, selected on
+  **validation** at the alert budget. That is a forecast-relative detector — "is this
+  patient heading above their *own* band" — not a population outlier model.
+- **Model 2** is retained on a `BASELINE` verdict rather than swapped, because once the
+  governance caps are applied to every candidate the alternatives are constants and
+  replacing the blend would delete personalisation instead of simplifying it. The verdict
+  is still recorded in `offset_scorecard.csv` and the artifact.
+
 The ML layer produces provider-visible **advisories**. It never writes a
 DeviationAlert, and the emergency floor (SBP ≥ 180 / DBP ≥ 120) is never
 personalised — safety gate 1 proves this by differential execution on every run.

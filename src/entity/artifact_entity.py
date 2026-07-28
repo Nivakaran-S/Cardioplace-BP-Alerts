@@ -85,6 +85,9 @@ class OffsetMetricArtifact:
     max_threshold: float
     emergency_floor: float
     n_capped: int
+    ship: str = ""
+    best_legal_alternative: str = ""
+    gain_mmHg: float = float("nan")
 
     @property
     def floor_holds(self) -> bool:
