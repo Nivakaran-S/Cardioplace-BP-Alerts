@@ -26,10 +26,9 @@ import pickle
 import subprocess
 import sys
 import threading
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import gradio as gr
 import numpy as np
@@ -429,11 +428,6 @@ def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-
 @app.get("/api/health")
 def health():
     return {"status": "ok", "model_loaded": STORE.ready, "model_source": STORE.source,
@@ -652,14 +646,13 @@ def _gradio_predict(readings_text, patient_id, age, sex, dm, symptoms):
         lines.append(f"**Early warning** {'FLAGGED' if ew['flagged'] else 'not flagged'} "
                      f"— score {ew['score']} vs cut {ew['cut']}")
     lines.append("")
-    lines.append("The full dashboard, with all three models charted, is at "
-                 "[/dashboard](/dashboard).")
+    lines.append("The full dashboard, with all three models charted, is at [/](/).")
     return "\n".join(lines), a
 
 
 with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False) as demo:
     gr.Markdown("## Cardioplace BP Alerts\nQuick check. The full dashboard — three "
-                "models, rule engine, backtest — is at [/dashboard](/dashboard).")
+                "models, rule engine, backtest — is at [/](/).")
     with gr.Row():
         with gr.Column(scale=2):
             g_readings = gr.Textbox(label="Session readings", lines=10,
@@ -706,7 +699,7 @@ def _serve_on_space(port: int) -> None:
 
     ours = [r for r in app.routes
             if getattr(r, "path", "") == "/"
-            or getattr(r, "path", "").startswith(("/api", "/static", "/dashboard"))]
+            or getattr(r, "path", "").startswith(("/api", "/static"))]
     for route in reversed(ours):
         demo.app.routes.insert(0, route)
     logging.info("grafted %d FastAPI routes ahead of Gradio's catch-all "

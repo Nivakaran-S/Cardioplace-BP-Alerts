@@ -56,11 +56,13 @@ in 1M-row chunks, and the run includes a forward-chained random search.
 |---|---|
 | `GET /` | Dashboard (`templates/`, served by FastAPI) |
 | `GET /gradio` | Gradio interface over the same predictor |
-| `GET /api/health` | Liveness and whether a model is loaded |
+| `GET /api/health` | Liveness, loaded model, tier, training state |
+| `GET /api/schema` | Symptom / condition / medication vocabulary the form renders |
 | `GET /api/model` | Model version, selected families, governance parameters |
-| `POST /api/predict` | A patient's session history → the full advisory |
+| `POST /api/predict` | Session history → all three models, rule engine, backtest |
 | `POST /api/reload` | Reload the newest bundle from disk |
 | `POST /api/train` | Kick off a training run in the background |
+| `GET /api/train/status` | Progress and tailed log of that run |
 
 ### How it is hosted
 
