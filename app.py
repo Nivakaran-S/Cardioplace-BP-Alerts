@@ -264,8 +264,19 @@ def _engine_frame(req: PredictRequest, as_of: pd.Timestamp = None) -> pd.DataFra
 
     df = pd.DataFrame(rows).sort_values("step").reset_index(drop=True)
     df = attach_cadence(df, by=None)
+    # Every reading was current at the moment it was taken, so the historical rows are
+    # evaluated at age 0 -- that is what "what did the engine say at the time" means, and
+    # it is the whole point of the alert history panel. Ageing them against `now` instead
+    # gates the entire history the moment a patient stops logging, which reports that
+    # nothing ever fired.
+    #
+    # Only the newest reading has an age relative to now, and only it can be stale: it is
+    # the one being offered as the live alert state.
     now = pd.Timestamp(as_of) if as_of is not None else df.ts.max()
-    df["reading_age_days"] = (now - df.ts).dt.total_seconds() / 86400.0
+    df["reading_age_days"] = 0.0
+    if len(df):
+        df.loc[df.index[-1], "reading_age_days"] = float(
+            (now - df.ts.iloc[-1]).total_seconds() / 86400.0)
     df["weight_delta_24h"] = df.weight.diff().fillna(0.0)
     # prev_emergency reaches the predicates as a column: itertuples rows are immutable
     df["prev_emergency"] = (df.sbp.shift(1) >= 180).fillna(False)
