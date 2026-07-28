@@ -11,10 +11,10 @@ app_file: app.py
 python_version: "3.12"
 pinned: false
 short_description: BP forecasting, personalisation and early warning on HEMOBP
-# Run this on CPU basic (free). The stack is scikit-learn end to end and has no
-# GPU path, so ZeroGPU refuses it at startup with "No @spaces.GPU function
-# detected". This key is only a hint for anyone duplicating the Space -- the
-# running Space's tier is set in its own Settings and cannot be changed from here.
+# cpu-basic is what this app actually needs -- the stack is scikit-learn end to
+# end with no GPU path. It also runs on ZeroGPU: app.py registers the Gradio
+# handler as a @spaces.GPU entry point when the `spaces` package is present,
+# which is what ZeroGPU's supervisor looks for at startup. See "Hardware" below.
 suggested_hardware: cpu-basic
 ---
 
@@ -68,6 +68,24 @@ The Space runs the **Gradio SDK**, which ignores the `Dockerfile` and simply exe
 `app.py`. Gradio is therefore mounted onto the FastAPI app rather than the other way
 round, so one uvicorn process serves the dashboard, the REST API and the Gradio
 interface together. The `Dockerfile` is kept for running the same app anywhere else.
+
+### Hardware
+
+Nothing here uses a GPU, so **cpu-basic** is the natural tier. The app also runs on
+**ZeroGPU**, which matters because a Space created on ZeroGPU cannot be downgraded
+without a PRO subscription.
+
+ZeroGPU's supervisor terminates any Space it finds without a GPU entry point, and a
+merely-decorated function does not count — the entry point has to be the callable a
+Gradio event invokes, since its model is *event → allocate GPU → run → release*.
+`app.py` therefore wraps the Gradio handler in `_maybe_gpu`, which applies
+`@spaces.GPU` only when the `spaces` package is importable. HuggingFace injects that
+package on ZeroGPU alone, so on cpu-basic the decorator is the identity function and
+nothing changes. `GET /api/health` reports the detected tier.
+
+On ZeroGPU each prediction from the Gradio tab takes a GPU allocation it does not
+need, so it queues and draws on the tier's quota. Requests to `/api/predict` are not
+Gradio events and are unaffected.
 
 ```bash
 curl -X POST localhost:7860/api/predict -H "Content-Type: application/json" -d '{

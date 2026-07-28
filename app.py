@@ -6,7 +6,6 @@ training-time globals are read, so this process runs anywhere the artifact goes.
 """
 
 import glob
-import importlib.util
 import os
 import pickle
 import subprocess
@@ -31,22 +30,34 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
 
-# ------------------------------------------------------------- tier check
-# This pipeline is scikit-learn end to end and has no GPU path, so the Space must
-# run on cpu-basic. ZeroGPU is not a supported target: its supervisor terminates
-# this app shortly after startup, and a bare @spaces.GPU entry point does not
-# satisfy it -- ZeroGPU expects GPU work reachable from a Gradio event, which
-# would mean routing every CPU prediction through a GPU allocation queue.
+# --------------------------------------------------------- ZeroGPU support
+# Nothing in this pipeline uses a GPU -- it is scikit-learn end to end -- but a
+# Space that cannot be downgraded to cpu-basic must still satisfy ZeroGPU, whose
+# supervisor terminates any Space it finds without a GPU entry point.
 #
-# The Space's tier lives in its own Settings and cannot be set from this
-# repository, so the most this code can do is name the problem clearly in the log
-# instead of exiting for no visible reason.
-if os.getenv("SPACE_ID") and importlib.util.find_spec("spaces") is not None:
-    logging.error(
-        "This Space is on ZeroGPU, which will terminate the container shortly after "
-        "startup. Nothing in this app uses a GPU. Set Settings -> Space hardware to "
-        "'CPU basic' and rebuild."
-    )
+# A bare decorated function is not enough: the entry point has to be the callable
+# a Gradio event actually invokes, because ZeroGPU's model is event -> allocate
+# GPU -> run -> release. `_maybe_gpu` therefore decorates the Gradio handler
+# itself. The work inside stays on the CPU; the decoration exists to give ZeroGPU
+# the entry point it requires.
+#
+# `spaces` is injected by HuggingFace only on a ZeroGPU Space, so on cpu-basic
+# the import fails and the decorator is the identity function.
+try:
+    import spaces as _spaces
+except Exception:
+    _spaces = None
+
+ZEROGPU = _spaces is not None
+
+
+def _maybe_gpu(fn):
+    """Register `fn` as ZeroGPU's entry point when running on that tier."""
+    if _spaces is None:
+        return fn
+    logging.info("ZeroGPU tier: registering %s as the GPU entry point "
+                 "(the work itself is CPU-only)", fn.__name__)
+    return _spaces.GPU(duration=60)(fn)
 
 
 @asynccontextmanager
@@ -183,6 +194,7 @@ def health():
         "model_loaded": STORE.ready,
         "model_source": STORE.source,
         "detail": STORE.error,
+        "tier": "zerogpu" if ZEROGPU else "cpu",
     }
 
 
@@ -284,6 +296,7 @@ def _parse_readings(raw: str):
     return rows, errors
 
 
+@_maybe_gpu
 def _gradio_predict(readings_text, patient_id, age, sex, dm):
     if not STORE.ready:
         return f"### No model loaded\n\n{STORE.error}", {}
