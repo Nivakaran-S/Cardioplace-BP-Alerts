@@ -694,8 +694,19 @@ def _parse_readings(raw: str):
 
 
 def _sample_readings() -> str:
+    """Deterministic demo history ending TODAY.
+
+    It used to start at a hardcoded 2026-01-05. Once the staleness policy landed, that
+    made the sample data age past the 14-day limit and the app opened straight into
+    `stale` -- no forecast, no detector, panels missing -- which looks like a broken
+    dashboard rather than a working refusal. The series is anchored to the current date
+    so the default view exercises the live path; the seed keeps the values fixed.
+    """
     seed, sbp, dbp, w = 20260728, 138.0, 76.0, 74.0
-    out, d, gaps = [], datetime(2026, 1, 5), [2, 2, 3]
+    gaps = [2, 2, 3]
+    span = sum(gaps[i % 3] for i in range(33))      # 34 readings -> 33 gaps
+    out, d = [], datetime.now().replace(hour=0, minute=0, second=0,
+                                        microsecond=0) - timedelta(days=span)
     for i in range(34):
         seed = (seed * 1103515245 + 12345) % 2147483648
         j = seed / 2147483648
@@ -871,8 +882,22 @@ def _render_dashboard(a: dict) -> str:
     h = ['<div class="cp">', DASH_CSS]
 
     # ---- banner ----
+    # `stale` is checked before everything else. A refused advisory has no forecast, no
+    # detector score and a gated current reading, so every branch below reads as "nothing
+    # due" -- which states the opposite of the truth: we did not look, rather than looked
+    # and found nothing.
     first_fire = next((x for x in hz if x.get("fired")), None)
-    if cur.get("is_emergency"):
+    stale = a.get("staleness") or {}
+    if a.get("confidence_tier") == "stale":
+        cls, ic = "watch", "&#9673;"
+        t = (f"Readings are {stale.get('days_since_last_reading', '?')} days old — "
+             "no forecast issued")
+        d = (f"The last reading was {stale.get('last_reading', '?')[:10]}, beyond the "
+             f"{stale.get('max_forecast_age_days', '?')}-day limit. Every lag and average "
+             "describes a patient who has not been seen since, so the forecaster and the "
+             "detector are withheld rather than guessed. The personalised threshold and "
+             "the alert history below remain valid.")
+    elif cur.get("is_emergency"):
         cls, ic = "crit", "&#9888;"
         t = "Rule engine fired an emergency alert on the latest reading"
         d = (_pretty(cur.get("rule_id")) + " — the emergency floor is never personalised "
@@ -1032,6 +1057,13 @@ def _render_dashboard(a: dict) -> str:
     # ---- Model 3: anomaly ----
     an = a.get("anomaly") or {}
     scored = [p for p in (an.get("points") or []) if p["score"] is not None]
+    if not scored and a.get("confidence_tier") == "stale":
+        # Say why it is absent. A panel that simply disappears is indistinguishable from
+        # one that is broken, which is how a deliberate refusal gets read as a bug.
+        h.append('<div class="pnl"><h3>Model 3 — early-warning detector</h3>'
+                 '<p class="hint">Withheld: the detector scores the forecast against this '
+                 "patient's own band, so it inherits the same staleness that withheld the "
+                 "forecast. It resumes on the next reading.</p></div>")
     if scored and len(an["points"]) >= 2:
         pts = an["points"]
         scores = [p["score"] for p in pts]     # None leaves a gap in the line
