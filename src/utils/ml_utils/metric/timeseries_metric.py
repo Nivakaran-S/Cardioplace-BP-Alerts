@@ -1,0 +1,238 @@
+"""Detector, offset, fairness, calibration and drift metrics.
+
+Port of notebook sections 7 (scorecard), 8.3, 9, 11 and 19. These answer "is this
+clinically useful", as distinct from the point-forecast metrics in `regression_metric`.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (average_precision_score, brier_score_loss,
+                             mean_absolute_error, r2_score, roc_auc_score)
+
+from src.utils.ml_utils.metric.regression_metric import bootstrap_ci
+
+FAIR_MARGIN_PP = 0.05
+
+
+# --------------------------------------------------------------------------- detector
+
+def detector_scorecard(df: pd.DataFrame, detectors: list, sessions_per_week: float,
+                       budgets=(1, 2, 5, 10)) -> pd.DataFrame:
+    """Precision / recall / lead time for each detector at each alert budget."""
+    rows = []
+    for col in detectors:
+        s = df[[col, "event_next", "event_step", "step", "days_since_last"]].dropna(subset=[col])
+        if s.event_next.nunique() < 2 or len(s) < 50:
+            continue
+        base = float(s.event_next.mean())
+        auc = roc_auc_score(s.event_next, s[col])
+        ap = average_precision_score(s.event_next, s[col])
+        for b in budgets:
+            cut = np.percentile(s[col], 100 - b)
+            flag = (s[col] >= cut).astype(int)
+            tp = int(((flag == 1) & (s.event_next == 1)).sum())
+            fp = int(((flag == 1) & (s.event_next == 0)).sum())
+            fn = int(((flag == 0) & (s.event_next == 1)).sum())
+            prec = tp / (tp + fp) if tp + fp else np.nan
+            hit = s[(flag == 1) & (s.event_next == 1)]
+            lead_sessions = hit.event_step - hit.step
+            lead_days = (lead_sessions * hit.days_since_last.median() if len(hit)
+                         else pd.Series(dtype=float))
+            rows.append(dict(
+                detector=col, budget_pct=b, base_rate=round(base, 4),
+                precision=round(prec, 3) if np.isfinite(prec) else np.nan,
+                lift=round(prec / base, 2) if base and np.isfinite(prec) else np.nan,
+                recall=round(tp / (tp + fn), 3) if tp + fn else np.nan,
+                auc_roc=round(auc, 3), auc_pr=round(ap, 3), auc_pr_lift=round(ap / base, 2),
+                lead_days_p10=round(float(lead_days.quantile(.10)), 2) if len(hit) else np.nan,
+                lead_days_median=round(float(lead_days.median()), 2) if len(hit) else np.nan,
+                lead_days_p90=round(float(lead_days.quantile(.90)), 2) if len(hit) else np.nan,
+                alerts_per_patient_week=round(b / 100 * sessions_per_week, 2)))
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------- offset
+
+def offset_scorecard(M: pd.DataFrame, label: str, population_threshold: float) -> pd.DataFrame:
+    """Learned blend vs personal-only, cohort-only and the population constant."""
+    candidates = {"learned (capped blend)": M.threshold.values,
+                  "personal only": M.personal.values,
+                  "cohort only": M.cohort.values,
+                  "population constant": np.full(len(M), population_threshold)}
+    rows = []
+    for name, p in candidates.items():
+        mae, (lo, hi) = bootstrap_ci(mean_absolute_error, M.actual.values, p)
+        rows.append(dict(split=label, model=name, MAE=round(mae, 2), lo=round(lo, 2),
+                         hi=round(hi, 2), R2=round(r2_score(M.actual.values, p), 3),
+                         within_10mmHg=round(float(np.mean(np.abs(M.actual.values - p) <= 10)), 3)))
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- fairness
+
+def slice_gate(df: pd.DataFrame, group_cols, metric, margin: float,
+               label: str, min_n: int = 30) -> pd.DataFrame:
+    """Compare a metric per subgroup against the overall value, with a pass/fail margin."""
+    overall = metric(df)
+    rows = []
+    for gc in group_cols:
+        if gc not in df.columns:
+            continue
+        for level, sub in df.groupby(gc, observed=True):
+            if len(sub) < min_n:
+                continue
+            v = metric(sub)
+            if not np.isfinite(v):
+                continue
+            rows.append(dict(metric=label, axis=gc, level=str(level), n=len(sub),
+                             value=round(v, 3), overall=round(overall, 3),
+                             gap=round(v - overall, 3), passes=abs(v - overall) <= margin))
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------ calibration/utility
+
+def expected_calibration_error(y, p, bins: int = 10) -> float:
+    df = pd.DataFrame({"y": y, "p": p}).dropna()
+    if len(df) < 50:
+        return np.nan
+    df["bin"] = pd.qcut(df.p, min(bins, df.p.nunique()), duplicates="drop")
+    g = df.groupby("bin", observed=True).agg(conf=("p", "mean"), acc=("y", "mean"),
+                                             n=("y", "size"))
+    return float((g.n / g.n.sum() * (g.conf - g.acc).abs()).sum())
+
+
+def tier_metrics(y_true_bin, p, thr: float, prevalence: float,
+                 unit: str = "per patient-step") -> dict:
+    """Sensitivity/specificity/PPV/NPV/NNA at one operating point, base rate disclosed.
+
+    Every row discloses its base rate: a Brier of 0.15 at a prevalence of 0.005 is nearly
+    perfect; the same 0.15 at 0.6 is barely better than random. Without prevalence the
+    number is uninterpretable.
+    """
+    y_true_bin = np.asarray(y_true_bin)
+    p = np.asarray(p, float)
+    yhat = (p >= thr).astype(int)
+    tp = int(((yhat == 1) & (y_true_bin == 1)).sum())
+    fp = int(((yhat == 1) & (y_true_bin == 0)).sum())
+    fn = int(((yhat == 0) & (y_true_bin == 1)).sum())
+    tn = int(((yhat == 0) & (y_true_bin == 0)).sum())
+    sens = tp / (tp + fn) if tp + fn else np.nan
+    spec = tn / (tn + fp) if tn + fp else np.nan
+    ppv = tp / (tp + fp) if tp + fp else np.nan
+    npv = tn / (tn + fn) if tn + fn else np.nan
+    return dict(prevalence=round(prevalence, 4), threshold=round(thr, 3),
+                sensitivity=round(sens, 3), specificity=round(spec, 3),
+                PPV=round(ppv, 3), NPV=round(npv, 3),
+                NNA=round(1 / ppv, 1) if ppv and np.isfinite(ppv) and ppv > 0 else np.nan,
+                AUC_PR=round(average_precision_score(y_true_bin, p), 3),
+                AUC_ROC=round(roc_auc_score(y_true_bin, p), 3),
+                Brier=round(brier_score_loss(y_true_bin, p), 4),
+                ECE=round(expected_calibration_error(y_true_bin, p), 4),
+                unit=unit, n=len(p))
+
+
+def decision_curve(y, p, thresholds=None) -> pd.DataFrame:
+    """Net benefit across threshold probabilities (Vickers & Elkin 2006).
+
+    net_benefit = TP/n - FP/n * pt/(1-pt). Compared against 'treat all' and 'treat none'.
+    """
+    if thresholds is None:
+        thresholds = np.linspace(0.01, 0.60, 40)
+    y = np.asarray(y)
+    p = np.asarray(p, float)
+    n = len(y)
+    out = []
+    for pt in thresholds:
+        yhat = (p >= pt).astype(int)
+        tp = float(((yhat == 1) & (y == 1)).sum())
+        fp = float(((yhat == 1) & (y == 0)).sum())
+        nb = tp / n - fp / n * (pt / (1 - pt))
+        prev = float(np.mean(y))
+        nb_all = prev - (1 - prev) * (pt / (1 - pt))
+        out.append(dict(threshold=pt, net_benefit=nb, nb_treat_all=nb_all, nb_treat_none=0.0))
+    return pd.DataFrame(out)
+
+
+def elicitation_table(y, p, sessions_per_week: float,
+                      nna_options=(3, 5, 10, 15, 20)) -> pd.DataFrame:
+    """The harm:benefit trade-off rendered as a table a clinician can answer from."""
+    y = np.asarray(y)
+    p = np.asarray(p, float)
+    rows = []
+    for nna in nna_options:
+        pt = 1 / nna
+        yhat = (p >= pt).astype(int)
+        tp = float(((yhat == 1) & (y == 1)).sum())
+        fp = float(((yhat == 1) & (y == 0)).sum())
+        fn = float(((yhat == 0) & (y == 1)).sum())
+        rows.append(dict(
+            question_answer=f"I'd review {nna} advisories to catch 1 true event",
+            implied_p_t=round(pt, 3),
+            sensitivity=round(tp / (tp + fn), 3) if tp + fn else np.nan,
+            PPV=round(tp / (tp + fp), 3) if tp + fp else np.nan,
+            alerts_per_patient_week=round(float(yhat.mean()) * sessions_per_week, 2)))
+    return pd.DataFrame(rows)
+
+
+# -------------------------------------------------------------------------- monitoring
+
+def population_stability_index(expected: np.ndarray, actual: np.ndarray,
+                               bins: int = 10) -> float:
+    """PSI between a reference and a current distribution. >0.2 is the conventional alarm."""
+    e = pd.Series(expected).replace([np.inf, -np.inf], np.nan).dropna()
+    a = pd.Series(actual).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(e) < 50 or len(a) < 50 or e.nunique() < 3:
+        return np.nan
+    edges = np.unique(np.quantile(e, np.linspace(0, 1, bins + 1)))
+    if len(edges) < 3:
+        return np.nan
+    edges[0], edges[-1] = -np.inf, np.inf
+    pe = np.histogram(e, edges)[0] / len(e)
+    pa = np.histogram(a, edges)[0] / len(a)
+    pe, pa = np.clip(pe, 1e-6, None), np.clip(pa, 1e-6, None)
+    return float(np.sum((pa - pe) * np.log(pa / pe)))
+
+
+class DriftMonitor:
+    """Feature drift (PSI), forecast-error drift and alert-rate drift, with a response ladder."""
+
+    PSI_WARN, PSI_ALARM = 0.10, 0.20
+    ERROR_ALARM_REL = 0.10      # >10% relative MAE degradation
+    RATE_ALARM_REL = 0.50       # alert rate off target by >50% relative
+
+    def __init__(self, reference: pd.DataFrame, features: list):
+        self.ref, self.features = reference, features
+
+    def feature_drift(self, current: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
+        rows = [dict(feature=f,
+                     psi=population_stability_index(self.ref[f].values, current[f].values))
+                for f in self.features if f in self.ref.columns and f in current.columns]
+        out = pd.DataFrame(rows).dropna().sort_values("psi", ascending=False)
+        if out.empty:
+            return out
+        out["status"] = np.where(out.psi >= self.PSI_ALARM, "ALARM",
+                                 np.where(out.psi >= self.PSI_WARN, "WARN", "ok"))
+        return out.head(top_n)
+
+    def error_drift(self, ref_mae: float, cur_mae: float) -> dict:
+        rel = (cur_mae - ref_mae) / max(ref_mae, 1e-9)
+        return dict(signal="forecast error", reference=round(ref_mae, 3),
+                    current=round(cur_mae, 3), relative_change=round(rel, 3),
+                    status="ALARM" if rel > self.ERROR_ALARM_REL else "ok",
+                    needs_labels=False, detectable_within="1-7 days (self-supervised)")
+
+    def alert_rate_drift(self, observed_rate: float, target_rate: float) -> dict:
+        rel = abs(observed_rate - target_rate) / max(target_rate, 1e-9)
+        return dict(signal="alert rate", reference=round(target_rate, 4),
+                    current=round(observed_rate, 4), relative_change=round(rel, 3),
+                    status="ALARM" if rel > self.RATE_ALARM_REL else "ok",
+                    needs_labels=False, detectable_within="days")
+
+    @staticmethod
+    def response_ladder(status: str) -> str:
+        if status != "ALARM":
+            return "no action; continue monitoring"
+        return ("1) recalibrate (cheap, frequent) -> 2) full refit only if recalibration does not "
+                "restore the metric (governed) -> 3) roll back if neither does. Log which step "
+                "resolved it; that distribution is what sets the real cadence.")

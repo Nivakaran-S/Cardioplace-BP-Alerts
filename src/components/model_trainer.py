@@ -1,0 +1,572 @@
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import mean_absolute_error
+
+from src.entity.artifact_entity import (DataTransformationArtifact, DetectorMetricArtifact,
+                                        ModelTrainerArtifact, OffsetMetricArtifact,
+                                        RuleEngineArtifact, SafetyGateArtifact)
+from src.entity.config_entity import ModelTrainerConfig
+from src.exception.custom_exception import CustomException
+from src.logging.logger import logging, timer
+
+from src.utils.main_utils.utils import (load_dataframe, read_yaml_file, save_object,
+                                        save_report, write_yaml_file)
+from src.utils.ml_utils.metric.regression_metric import (get_forecast_score, select_and_decide,
+                                                         ship_decision)
+from src.utils.ml_utils.metric.timeseries_metric import (FAIR_MARGIN_PP, DriftMonitor,
+                                                         decision_curve, detector_scorecard,
+                                                         elicitation_table, offset_scorecard,
+                                                         slice_gate, tier_metrics)
+from src.utils.ml_utils.model.classifier_head import build_classifier_frame, train_tier_head
+from src.utils.ml_utils.model.detector import (BASE_DETECTORS, DETECTOR_FAMILY,
+                                               EarlyWarningDataset, build_score_matrix,
+                                               fit_default_detectors, fuse_detectors,
+                                               tune_detectors, widen_detector_set)
+from src.utils.ml_utils.model.estimator import (BPPredictor, MODEL_KINDS, champion_challenger,
+                                                explain_prediction, fit_quantile_interval,
+                                                make_model, random_search, run_sweep)
+from src.utils.ml_utils.model.offset import observed_band, search_offset
+from src.utils.ml_utils.rule_engine.advisory import arbitrate, build_advisories
+from src.utils.ml_utils.rule_engine.engine import RuleEngine
+from src.utils.ml_utils.rule_engine.labels import (disposition_coverage, label_quality,
+                                                   simulate_dispositions)
+from src.utils.ml_utils.rule_engine.registry import TIERS, build_registry
+from src.utils.ml_utils.rule_engine.synthetic import (ExtendedRuleEngine,
+                                                      generate_synthetic_cohort,
+                                                      prepare_synthetic_run, rule_coverage,
+                                                      synth_param_table)
+from src.utils.ml_utils.safety.gates import (AbstentionPolicy, cold_start_curve,
+                                             provenance_guard, run_safety_gates)
+
+import mlflow
+from urllib.parse import urlparse
+
+import dagshub
+# dagshub.init(repo_owner='sliitguy', repo_name='SecurityNetwork', mlflow=True)
+
+
+from dotenv import load_dotenv
+load_dotenv()
+
+
+# Only assign when the variable is actually set: os.environ[...] = None raises TypeError,
+# which would take the whole module down at import time against an empty .env.
+for _var in ("MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD"):
+    _val = os.getenv(_var)
+    if _val:
+        os.environ[_var] = _val
+
+
+class ModelTrainer:
+    def __init__(self, model_trainer_config: ModelTrainerConfig,
+                 data_transformation_artifact: DataTransformationArtifact):
+        try:
+            self.model_trainer_config = model_trainer_config
+            self.data_transformation_artifact = data_transformation_artifact
+            self.best_params = {}
+        except Exception as e:
+            raise CustomException(e, sys)
+
+    def track_mlflow(self, best_model, metrics: dict, tag: str = "forecast"):
+        # Registry follows tracking. Hardcoding it lets the two drift onto different
+        # DagsHub repos, so runs land in one project and registered models in another.
+        _registry = os.getenv("MLFLOW_TRACKING_URI")
+        if _registry:
+            mlflow.set_registry_uri(_registry)
+        tracking_url_type_store = urlparse(mlflow.get_tracking_uri()).scheme
+        try:
+            with mlflow.start_run(nested=True):
+                mlflow.set_tag("stage", tag)
+                for k, v in metrics.items():
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(fv):
+                        mlflow.log_metric(k, fv)
+                if best_model is not None and tracking_url_type_store != "file":
+                    mlflow.sklearn.log_model(best_model, "model")
+        except Exception as exc:
+            # Tracking is observability, not a training dependency. A missing DagsHub
+            # credential must not lose a completed run.
+            logging.warning("mlflow tracking skipped (%s): %s", tag, exc)
+
+    # ------------------------------------------------------------------ forecaster
+    def train_forecasters(self, F, features, config):
+        """Baselines, sweep, random search, then the ship decision."""
+        with timer("baseline sweep"):
+            R_default, _, _ = run_sweep(F, features, config)
+        if R_default.empty:
+            raise ValueError("the sweep produced no scorable rows; the cohort is too small")
+
+        R, tune_log, comparison = R_default, pd.DataFrame(), pd.DataFrame()
+        if config.tune:
+            with timer(f"random search ({config.tune_draws} draws x {config.tune_folds} folds)"):
+                tune_log = random_search(F, features, config, self.best_params)
+            if self.best_params:
+                # Re-run the identical sweep with tuned parameters so every number below
+                # describes the tuned model. R_default survives as the null hypothesis.
+                with timer("tuned sweep"):
+                    R, _, _ = run_sweep(F, features, config, params=self.best_params)
+                comparison = self._tuning_comparison(R_default, R)
+
+        winner, decision = select_and_decide(R, config)
+        logging.info("selection: %s", winner)
+        if len(decision):
+            logging.info("ship decision:\n%s", decision.to_string(index=False))
+        return R, tune_log, comparison, winner, decision
+
+    @staticmethod
+    def _tuning_comparison(R_default: pd.DataFrame, R_tuned: pd.DataFrame) -> pd.DataFrame:
+        """A tuning gain smaller than the bootstrap CI is not a gain."""
+        d = R_default[R_default.split == "test"]
+        t = R_tuned[R_tuned.split == "test"]
+        cmp = (d.groupby(["signal", "model"]).MAE.mean().rename("default").to_frame()
+               .join(t.groupby(["signal", "model"]).MAE.mean().rename("tuned"))
+               .join(d.assign(w=lambda x: x.MAE_hi - x.MAE_lo)
+                     .groupby(["signal", "model"]).w.mean().rename("CI_width")))
+        cmp["delta"] = (cmp["default"] - cmp["tuned"]).round(3)
+        cmp["beyond_noise"] = cmp.delta.abs() > cmp.CI_width
+        logging.info("tuning: %d of %d cells moved beyond the bootstrap CI",
+                     int(cmp.beyond_noise.sum()), len(cmp))
+        return cmp.round(3).reset_index()
+
+    # ------------------------------------------------------------------ detector
+    def train_detectors(self, F, features, config, winner):
+        with timer("early-warning dataset"):
+            ew = EarlyWarningDataset(config)
+            D = ew.build(F, features)
+
+        imputer, dense_cols, X_train, X_all = build_score_matrix(D, features)
+        D = fit_default_detectors(D, X_train, X_all)
+        best_detector = tune_detectors(D, imputer, dense_cols, X_train, X_all)
+
+        # The forecast-based detectors reuse Part 6's winner; they are the ones most likely
+        # to win, so they are wired in rather than left as a note.
+        forecaster, fc_target = None, f"y_sbp_h{config.horizons[0]}"
+        try:
+            kind = winner.get("sbp", MODEL_KINDS[-1])
+            fit_rows = D[(D.split == "train") & D[fc_target].notna()]
+            if len(fit_rows) > 200:
+                if len(fit_rows) > config.max_train_rows:
+                    fit_rows = fit_rows.sample(config.max_train_rows, random_state=config.seed)
+                forecaster = make_model(kind, **self.best_params.get((kind, "sbp"), {})).fit(
+                    fit_rows[features], fit_rows[fc_target])
+        except Exception as exc:
+            logging.warning("forecast-residual detector unavailable: %s", exc)
+
+        detectors = list(BASE_DETECTORS)
+        detectors += [d for d in widen_detector_set(D, X_train, X_all, features,
+                                                    forecaster, fc_target)
+                      if d not in detectors]
+        detectors += [d for d in fuse_detectors(D, detectors) if d not in detectors]
+        logging.info("detector set: %d scorers across %d families", len(detectors),
+                     len({DETECTOR_FAMILY.get(d, "?") for d in detectors}))
+
+        D_test = D[(D.split == "test") & D.event_next.notna()]
+        D_val = D[(D.split == "val") & D.event_next.notna()]
+        sessions_per_week = 7.0 / max(float(D.days_since_last.median()), 1e-9)
+        det_report = detector_scorecard(D_test, detectors, sessions_per_week)
+        if len(det_report):
+            det_report["family"] = det_report.detector.map(DETECTOR_FAMILY).fillna("?")
+        return (D, D_val, D_test, detectors, det_report, imputer, dense_cols,
+                best_detector, sessions_per_week)
+
+    # ------------------------------------------------------------------ orchestration
+    def initiate_model_trainer(self) -> ModelTrainerArtifact:
+        try:
+            config = self.model_trainer_config
+            os.makedirs(config.report_dir, exist_ok=True)
+
+            meta = read_yaml_file(self.data_transformation_artifact.feature_list_file_path)
+            features = list(meta["features"])
+            F = load_dataframe(self.data_transformation_artifact.feature_file_path)
+            panel = load_dataframe(self.data_transformation_artifact.panel_file_path)
+            for df in (F, panel):
+                if "ts" in df.columns:
+                    df["ts"] = pd.to_datetime(df.ts, errors="coerce")
+                df["series_id"] = df.series_id.astype(str)
+            logging.info("loaded %d feature rows, %d panel rows, %d features",
+                         len(F), len(panel), len(features))
+
+            # ---- 1. forecaster ------------------------------------------------
+            R, tune_log, tune_cmp, winner, decision = self.train_forecasters(
+                F, features, config)
+            save_report(config.report_path("forecast_scorecard.csv"), R)
+            if len(tune_log):
+                save_report(config.report_path("tuning_log.csv"), tune_log)
+            if len(tune_cmp):
+                save_report(config.report_path("tuning_default_vs_tuned.csv"), tune_cmp)
+            if len(decision):
+                save_report(config.report_path("ship_decision.csv"), decision)
+
+            # ---- 2. prediction intervals --------------------------------------
+            interval_signal = "sbp"
+            interval_horizon = config.horizons[min(1, len(config.horizons) - 1)]
+            qmodels, qhat = fit_quantile_interval(F, features, config, self.best_params,
+                                                  interval_signal, interval_horizon)
+
+            # ---- 3. personalisation offset ------------------------------------
+            with timer("offset search"):
+                offset_model, offset_search = search_offset(F, config)
+            OFF = offset_model.transform(F)
+            assert OFF.empty or OFF.threshold.max() < config.emergency_floor_mmHg, \
+                "offset breached the emergency floor"
+            band = observed_band(F, offset_model.warm)
+            M_all = OFF.merge(band, on="series_id").dropna(subset=["actual"])
+            M_hold = M_all[M_all.patient_split == "holdout"]
+            off_report = pd.DataFrame()
+            offset_artifact = None
+            if len(M_hold) >= 10:
+                off_report = pd.concat([
+                    offset_scorecard(M_hold, "held-out patients",
+                                     config.population_threshold_mmHg),
+                    offset_scorecard(M_all, "all patients",
+                                     config.population_threshold_mmHg)]).sort_values(
+                    ["split", "MAE"])
+                save_report(config.report_path("offset_scorecard.csv"), off_report)
+                h_ = off_report[off_report.split == "held-out patients"]
+                learned = float(h_[h_.model == "learned (capped blend)"].MAE.iloc[0])
+                base = float(h_[h_.model != "learned (capped blend)"].MAE.min())
+                ci_w = float(h_[h_.model == "learned (capped blend)"].eval("hi - lo").iloc[0])
+                verdict, gain = ship_decision(learned, base, ci_w)
+                logging.info("offset decision -> %s (gain %+.2f mmHg vs best baseline)",
+                             verdict, gain)
+                offset_artifact = OffsetMetricArtifact(
+                    label="capped shrinkage blend", warm=offset_model.warm,
+                    k=offset_model.k, q=offset_model.q, n_patients=len(M_hold),
+                    mae=round(learned, 3),
+                    max_threshold=float(OFF.threshold.max()),
+                    emergency_floor=config.emergency_floor_mmHg,
+                    n_capped=int(OFF.capped.sum()))
+            if len(offset_search):
+                save_report(config.report_path("offset_search.csv"), offset_search)
+
+            # ---- 4. early-warning detectors -----------------------------------
+            with timer("detector training"):
+                (D, D_val, D_test, detectors, det_report, imputer, dense_cols,
+                 best_detector, sessions_per_week) = self.train_detectors(
+                    F, features, config, winner)
+            detector_artifacts = []
+            if len(det_report):
+                save_report(config.report_path("detector_scorecard.csv"), det_report)
+                at_budget = det_report[det_report.budget_pct == config.alert_budget_pct]
+                for r in at_budget.sort_values("auc_pr", ascending=False).head(5).itertuples():
+                    detector_artifacts.append(DetectorMetricArtifact(
+                        detector=r.detector, budget_pct=float(r.budget_pct),
+                        base_rate=float(r.base_rate), precision=float(r.precision),
+                        recall=float(r.recall), lift=float(r.lift),
+                        auc_roc=float(r.auc_roc), auc_pr=float(r.auc_pr),
+                        auc_pr_lift=float(r.auc_pr_lift),
+                        lead_days_median=float(r.lead_days_median),
+                        alerts_per_patient_week=float(r.alerts_per_patient_week)))
+
+            # ---- 5. rule engine ------------------------------------------------
+            registry = build_registry()
+            save_report(config.report_path("rule_registry.csv"),
+                        registry.assign(needs=registry.needs.astype(str),
+                                        blocked_by=registry.blocked_by.astype(str)))
+            personal_thr = dict(zip(OFF.series_id, OFF.threshold)) if len(OFF) else {}
+            engine = RuleEngine(registry, personal_thr)
+            with timer("rule engine (population mode)"):
+                alerts_pop = engine.run(panel, use_personalisation=False)
+            with timer("rule engine (personalised mode)"):
+                alerts_pers = engine.run(panel, use_personalisation=True)
+            save_report(config.report_path("alerts_population.csv"), alerts_pop)
+            logging.info("%d readings evaluated | %d alerts fired (%.1f%%)",
+                         len(alerts_pop), int(alerts_pop.fired.sum()),
+                         100 * alerts_pop.fired.mean())
+
+            rule_artifact = RuleEngineArtifact(
+                alerts_file_path=config.report_path("alerts_population.csv"),
+                registry_file_path=config.report_path("rule_registry.csv"),
+                rows_evaluated=int(len(alerts_pop)),
+                alerts_fired=int(alerts_pop.fired.sum()),
+                emergency_fired=int(alerts_pop.is_emergency.sum()),
+                evaluable_rules=int((registry.status == "EVALUABLE").sum()),
+                blocked_rules=int((registry.status == "BLOCKED_ON_INPUTS").sum()))
+
+            # ---- 6. label engineering -----------------------------------------
+            save_report(config.report_path("disposition_coverage.csv"),
+                        disposition_coverage(registry, TIERS))
+            dispo = simulate_dispositions(alerts_pop, panel, seed=config.seed)
+            if len(dispo):
+                write_yaml_file(config.report_path("label_quality.yaml"),
+                                label_quality(dispo, panel), replace=True)
+
+            # ---- 7. classifier heads -------------------------------------------
+            with timer("tier + rule heads"):
+                CLS = build_classifier_frame(F, alerts_pop, config.horizons[0])
+                tier_clf, rule_clf, rule_report, te_c, proba_te = train_tier_head(
+                    CLS, features, config, seed=config.seed)
+            if len(rule_report):
+                save_report(config.report_path("rule_head_report.csv"), rule_report)
+
+            # ---- 8. clinical-utility metrics ------------------------------------
+            tier_rows = []
+            if tier_clf is not None and proba_te is not None and len(te_c):
+                classes = list(tier_clf.classes_)
+                for tier in [t for t in classes if t != "NO_ALERT"]:
+                    j = classes.index(tier)
+                    y_bin = (te_c.tier_future.values == tier).astype(int)
+                    if y_bin.sum() < 20:
+                        continue
+                    p = proba_te[:, j]
+                    thr = float(np.percentile(p, 100 - config.alert_budget_pct))
+                    tier_rows.append(dict(tier=tier,
+                                          **tier_metrics(y_bin, p, thr, float(y_bin.mean()))))
+            tier_metrics_df = pd.DataFrame(tier_rows)
+            if len(tier_metrics_df):
+                save_report(config.report_path("tier_metrics.csv"), tier_metrics_df)
+                focus = tier_metrics_df.sort_values("AUC_PR").iloc[-1].tier
+                j = list(tier_clf.classes_).index(focus)
+                y_f = (te_c.tier_future.values == focus).astype(int)
+                p_f = proba_te[:, j]
+                save_report(config.report_path("decision_curve.csv"), decision_curve(y_f, p_f))
+                save_report(config.report_path("elicitation.csv"),
+                            elicitation_table(y_f, p_f, sessions_per_week))
+
+            # ---- 9. serving bundle ----------------------------------------------
+            det_params = (best_detector.get("isolation_forest", {}) or {}).get("params") or {}
+            fit_mask = F.split.isin(["train", "val"])
+            det = IsolationForest(random_state=config.seed, n_jobs=2, **det_params).fit(
+                imputer.transform(F[fit_mask][dense_cols]))
+            val_scores = -det.score_samples(imputer.transform(D_val[dense_cols])) \
+                if len(D_val) else np.array([0.0])
+            det_cut = float(np.percentile(val_scores, 100 - config.alert_budget_pct))
+
+            with timer("freeze serving artifacts"):
+                predictor = BPPredictor.build(
+                    F, features, config, winner, self.best_params, offset_model,
+                    qmodels, qhat, interval_signal, interval_horizon,
+                    det, imputer, dense_cols, det_cut)
+            os.makedirs(os.path.dirname(config.bundle_file_path), exist_ok=True)
+            predictor.save(config.bundle_file_path)
+            logging.info("bundle %s (%.1f MB) | model_version %s",
+                         os.path.basename(config.bundle_file_path),
+                         os.path.getsize(config.bundle_file_path) / 1e6,
+                         predictor.b["model_version"])
+
+            # ---- 10. fairness ----------------------------------------------------
+            fairness = self.run_fairness(F, features, config, winner, M_hold,
+                                         D_test, det_report)
+            if len(fairness):
+                save_report(config.report_path("fairness.csv"), fairness)
+
+            # ---- 11. advisories, abstention, explainability -----------------------
+            probe_id = panel.series_id.iloc[0]
+            hist = panel[panel.series_id == probe_id].sort_values("ts")
+            reloaded = BPPredictor.load(config.bundle_file_path)
+            advisories = build_advisories(reloaded, hist, tier_clf, rule_clf, features, config)
+            engine_today = alerts_pop[(alerts_pop.series_id == probe_id) & alerts_pop.fired]
+            shown, arb_log = arbitrate(advisories, set(engine_today.tail(1).tier.dropna()),
+                                       tau=config.confidence_tau)
+            logging.info("advisories generated: %d -> shown after arbitration: %d | %s",
+                         len(advisories), len(shown), arb_log)
+            if advisories:
+                save_report(config.report_path("advisories.csv"),
+                            pd.DataFrame([a.to_row() for a in advisories]))
+
+            row_x = reloaded.fb.transform_for_inference(hist).reindex(columns=features)
+            train_medians = F[F.split == "train"][features].median()
+            fc_model = (list(reloaded.b["forecasters"].values())[0]
+                        if reloaded.b["forecasters"] else None)
+            explanation = (explain_prediction(fc_model, row_x, features[:12], train_medians)
+                           if fc_model is not None else {})
+
+            ood_cols = [c for c in features if F[c].notna().mean() > .8][:25]
+            abstain = AbstentionPolicy(F[F.split == "train"], ood_cols)
+            te_ood = abstain._dist(F[F.split == "test"][ood_cols])
+            ood_rate = float(np.mean(te_ood > abstain.cut))
+
+            cold = cold_start_curve(reloaded, hist, config)
+            if len(cold):
+                save_report(config.report_path("cold_start.csv"), cold)
+
+            # ---- 12. synthetic cohort and rule coverage ---------------------------
+            with timer("synthetic daily cohort"):
+                synth = generate_synthetic_cohort()
+            synth_run, syn_personal = prepare_synthetic_run(synth)
+            with timer("extended engine, synthetic cohort"):
+                syn_alerts = ExtendedRuleEngine(registry, syn_personal).run(
+                    synth_run, use_personalisation=False)
+            coverage = rule_coverage(registry, alerts_pop, syn_alerts)
+            save_report(config.report_path("rule_coverage.csv"), coverage)
+            save_report(config.report_path("synthetic_parameters.csv"), synth_param_table())
+            logging.info("[SYNTHETIC] %d readings evaluated | %d alerts fired | "
+                         "rule coverage %d/%d",
+                         len(syn_alerts), int(syn_alerts.fired.sum()),
+                         int(coverage.covered.sum()), len(coverage))
+
+            prov = provenance_guard(panel, synth, alerts_pop, syn_alerts)
+            write_yaml_file(config.report_path("provenance.yaml"), prov, replace=True)
+            if not prov["holds"]:
+                raise AssertionError("provenance guard failed: synthetic rows reached the "
+                                     "real-data record")
+
+            # ---- 13. safety gates --------------------------------------------------
+            gates = run_safety_gates(alerts_pop, alerts_pers, OFF, advisories, cold,
+                                     fairness, explanation, abstain, ood_rate, config)
+            save_report(config.report_path("safety_gates.csv"), gates.frame())
+            gate_artifact = SafetyGateArtifact(
+                gate_report_file_path=config.report_path("safety_gates.csv"),
+                gates_passed=int((gates.frame().status == "PASS").sum()),
+                gates_total=int(len(gates.frame())),
+                critical_failures=int(len(gates.critical_failures)),
+                promotable=bool(gates.promotable))
+
+            # ---- 14. monitoring and champion/challenger ----------------------------
+            self.run_monitoring(F, features, config, R, winner, det_report)
+            chall = champion_challenger(F, features, config,
+                                        winner.get("sbp", "ridge"), "hgb")
+            if len(chall):
+                save_report(config.report_path("champion_challenger.csv"), chall)
+
+            # ---- 15. persist the model and track ------------------------------------
+            model_dir_path = os.path.dirname(config.trained_model_file_path)
+            os.makedirs(model_dir_path, exist_ok=True)
+            save_object(config.trained_model_file_path, predictor)
+            # model pusher
+            save_object(os.path.join(config.final_model_dir, "model.pkl"), predictor)
+
+            test_rows = R[(R.split == "test") & (R.family == "learned")]
+            val_rows = R[(R.split == "val") & (R.family == "learned")]
+            train_metrics = [get_forecast_score(r) for r in val_rows.to_dict("records")]
+            test_metrics = [get_forecast_score(r) for r in test_rows.to_dict("records")]
+
+            headline = {}
+            sbp_test = test_rows[test_rows.signal == "sbp"]
+            if len(sbp_test):
+                headline = dict(sbp_test_mae=float(sbp_test.MAE.mean()),
+                                sbp_test_rmse=float(sbp_test.RMSE.mean()),
+                                sbp_test_r2=float(sbp_test.R2.mean()))
+            if detector_artifacts:
+                headline["detector_auc_pr"] = detector_artifacts[0].auc_pr
+                headline["detector_lead_days"] = detector_artifacts[0].lead_days_median
+            if offset_artifact:
+                headline["offset_mae"] = offset_artifact.mae
+            headline["gates_passed"] = gate_artifact.gates_passed
+            headline["critical_gate_failures"] = gate_artifact.critical_failures
+            self.track_mlflow(fc_model, headline, tag="hemobp-bp")
+
+            if not gates.promotable:
+                logging.error("PROMOTION BLOCKED: %d critical safety-gate failures",
+                              gate_artifact.critical_failures)
+
+            model_trainer_artifact = ModelTrainerArtifact(
+                trained_model_file_path=config.trained_model_file_path,
+                bundle_file_path=config.bundle_file_path,
+                report_dir=config.report_dir,
+                selected_family=winner,
+                train_metric_artifact=train_metrics,
+                test_metric_artifact=test_metrics,
+                detector_metric_artifact=detector_artifacts,
+                offset_metric_artifact=offset_artifact,
+                rule_engine_artifact=rule_artifact,
+                safety_gate_artifact=gate_artifact,
+            )
+            logging.info("Model trainer artifact: %s", model_trainer_artifact)
+            return model_trainer_artifact
+        except Exception as e:
+            raise CustomException(e, sys)
+
+    # ------------------------------------------------------------------ fairness
+    def run_fairness(self, F, features, config, winner, M_hold, D_test, det_report):
+        """Subgroup performance for the forecaster, the offset and the best detector."""
+        try:
+            frames = []
+            target = f"y_sbp_h{config.horizons[0]}"
+            df_f = F[F[target].notna()]
+            tr_f = df_f[df_f.split == "train"]
+            if len(tr_f) > 200:
+                tr_f = tr_f.sample(min(config.max_train_rows, len(tr_f)),
+                                   random_state=config.seed)
+                kind = winner.get("sbp", "hgb")
+                m = make_model(kind, **self.best_params.get((kind, "sbp"), {})).fit(
+                    tr_f[features], tr_f[target].values)
+                te_f = df_f[df_f.split == "test"].copy()
+                if len(te_f) > 40:
+                    te_f["pred"] = m.predict(te_f[features])
+                    frames.append(slice_gate(
+                        te_f, ["is_male", "age_band", "is_dm"],
+                        lambda x: mean_absolute_error(x[target], x["pred"]),
+                        config.fair_margin_mmHg, "forecaster MAE (mmHg)"))
+
+            if len(M_hold) >= 30:
+                M_fair = M_hold.assign(age_band=pd.cut(
+                    M_hold.age, [0, 50, 65, 75, 200],
+                    labels=["<50", "50-64", "65-74", "75+"], right=False))
+                frames.append(slice_gate(
+                    M_fair, ["is_male", "age_band", "is_dm"],
+                    lambda x: mean_absolute_error(x["actual"], x["threshold"]),
+                    config.fair_margin_mmHg, "offset MAE (mmHg)"))
+
+            if len(det_report) and len(D_test):
+                learned = det_report[(det_report.budget_pct == config.alert_budget_pct)
+                                     & (det_report.detector != "d_fixed_threshold")]
+                if len(learned):
+                    best_col = learned.sort_values("auc_pr").iloc[-1].detector
+                    cut = float(np.percentile(D_test[best_col].dropna(),
+                                              100 - config.alert_budget_pct))
+                    dt = D_test.copy()
+                    dt["flag"] = (dt[best_col] >= cut).astype(int)
+                    dt["age_band"] = pd.cut(dt.age, [0, 50, 65, 75, 200],
+                                            labels=["<50", "50-64", "65-74", "75+"],
+                                            right=False)
+                    frames.append(slice_gate(
+                        dt, ["is_male", "age_band", "is_dm"],
+                        lambda x: (float(x[x.flag == 1].event_next.mean())
+                                   if (x.flag == 1).any() else np.nan),
+                        FAIR_MARGIN_PP,
+                        f"{best_col} precision @{config.alert_budget_pct}%"))
+
+            fairness = pd.concat([f for f in frames if len(f)], ignore_index=True) \
+                if any(len(f) for f in frames) else pd.DataFrame()
+            if len(fairness):
+                fail = fairness[~fairness.passes]
+                logging.info("slice gate: %d/%d pass", len(fairness) - len(fail), len(fairness))
+            logging.info("Not auditable on this corpus: race / ethnicity (absent from HEMOBP).")
+            return fairness
+        except Exception as e:
+            raise CustomException(e, sys)
+
+    # ------------------------------------------------------------------ monitoring
+    def run_monitoring(self, F, features, config, R, winner, det_report):
+        """PSI on features plus error and alert-rate drift, with the response ladder."""
+        try:
+            ref, cur = F[F.split == "train"], F[F.split == "test"]
+            mon = DriftMonitor(ref, features)
+            psi = mon.feature_drift(cur)
+            if len(psi):
+                save_report(config.report_path("feature_drift_psi.csv"), psi)
+
+            sel = winner.get("sbp")
+            ref_mae = float(R[(R.split == "val") & (R.signal == "sbp")
+                              & (R.model == sel)].MAE.mean())
+            cur_mae = float(R[(R.split == "test") & (R.signal == "sbp")
+                              & (R.model == sel)].MAE.mean())
+            observed_rate = config.alert_budget_pct / 100.0
+            if len(det_report):
+                at_budget = det_report[det_report.budget_pct == config.alert_budget_pct]
+                if len(at_budget):
+                    observed_rate = float(at_budget.iloc[0].budget_pct) / 100.0
+            signals = pd.DataFrame([
+                mon.error_drift(ref_mae, cur_mae),
+                mon.alert_rate_drift(observed_rate, config.alert_budget_pct / 100.0),
+            ])
+            save_report(config.report_path("drift_signals.csv"), signals)
+
+            n_alarm = int((psi.status == "ALARM").sum() if len(psi) else 0) \
+                + int((signals.status == "ALARM").sum())
+            logging.info("drift alarms: %d | %s", n_alarm,
+                         mon.response_ladder("ALARM" if n_alarm else "ok"))
+            logging.info("Train->test PSI is a within-cohort temporal shift, not deployment "
+                         "drift: a smoke test of the monitor and a floor on what to expect.")
+        except Exception as e:
+            raise CustomException(e, sys)

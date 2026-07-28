@@ -9,3 +9,12 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Pipeline run outputs
+Artifacts/
+logs/
+final_model/
+
+# MLflow local tracking store (created when MLFLOW_TRACKING_URI is unset)
+mlruns/
+mlflow.db
