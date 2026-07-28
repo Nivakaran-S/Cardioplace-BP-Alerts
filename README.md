@@ -6,6 +6,11 @@ colorTo: red
 sdk: docker
 app_port: 7860
 pinned: false
+short_description: BP forecasting, personalisation and early warning on HEMOBP
+# CPU only: the stack is scikit-learn end to end, nothing here uses a GPU.
+# ZeroGPU is Gradio-only and cannot be selected on a Docker Space -- picking it
+# fails the build with "ZeroGPU is only available on Gradio SDK".
+suggested_hardware: cpu-basic
 ---
 
 # Cardioplace BP Alerts
