@@ -27,7 +27,7 @@ import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 import gradio as gr
@@ -609,68 +609,533 @@ def _parse_readings(raw: str):
     return rows, errors
 
 
+def _sample_readings() -> str:
+    seed, sbp, dbp, w = 20260728, 138.0, 76.0, 74.0
+    out, d, gaps = [], datetime(2026, 1, 5), [2, 2, 3]
+    for i in range(34):
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        j = seed / 2147483648
+        sbp = 0.72 * sbp + 0.28 * (138 + i * 0.75) + (j - 0.5) * 13
+        dbp = 0.70 * dbp + 0.30 * (75 + i * 0.2) + (j - 0.5) * 7
+        w += (j - 0.45) * 0.4
+        out.append(f"{d:%Y-%m-%d}, {round(sbp)}, {round(dbp)}, "
+                   f"{round(70 + (j - 0.5) * 16)}, {w:.1f}")
+        d += timedelta(days=gaps[i % 3])
+    return "\n".join(out)
+
+
+# ---- server-side rendering -------------------------------------------------
+# The dashboard is rendered here rather than by templates/app.js, because a Gradio
+# Space may IMPORT this module instead of running it -- in which case nothing under
+# `if __name__ == "__main__"` executes, no FastAPI route is ever grafted, and the
+# browser would only ever see Gradio's own widgets. Everything below therefore
+# travels inside the Gradio payload: inline CSS, inline SVG, no /static fetch and
+# no /api call. templates/ still serves the identical view when FastAPI owns the
+# server locally.
+
+PALETTE = {  # validated categorical slots 1-2 + the reserved status ramp
+    "light": {"s1": "#2a78d6", "s2": "#eb6834", "surface": "#fcfcfb", "plane": "#f9f9f7",
+              "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#898781", "grid": "#e1e0d9",
+              "axis": "#c3c2b7", "border": "rgba(11,11,11,.10)"},
+}
+STATUS = {"good": "#0ca30c", "warning": "#fab219", "serious": "#ec835a",
+          "critical": "#d03b3b"}
+
+DASH_CSS = """
+<style>
+.cp{--s1:#2a78d6;--s2:#eb6834;--sf:#fcfcfb;--pl:#f9f9f7;--ink:#0b0b0b;--ink2:#52514e;
+ --mut:#898781;--bd:rgba(11,11,11,.10);--gd:#0ca30c;--wn:#fab219;--cr:#d03b3b;
+ font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);font-size:14px}
+@media (prefers-color-scheme:dark){.cp{--sf:#1a1a19;--pl:#0d0d0d;--ink:#fff;--ink2:#c3c2b7;
+ --bd:rgba(255,255,255,.12);--s1:#3987e5;--s2:#d95926}}
+.cp *{box-sizing:border-box}
+.cp .bn{display:flex;gap:12px;align-items:flex-start;background:var(--sf);
+ border:1px solid var(--bd);border-left:3px solid var(--mut);border-radius:10px;
+ padding:14px 16px;margin-bottom:16px}
+.cp .bn.good{border-left-color:var(--gd)}.cp .bn.watch{border-left-color:var(--wn)}
+.cp .bn.crit{border-left-color:var(--cr)}
+.cp .bn h4{margin:0;font-size:.95rem}.cp .bn p{margin:3px 0 0;font-size:.83rem;color:var(--ink2)}
+.cp .pnl{background:var(--sf);border:1px solid var(--bd);border-radius:10px;
+ padding:16px;margin-bottom:16px}
+.cp .pnl.acc{border-left:3px solid var(--s1)}
+.cp h3{margin:0 0 4px;font-size:.95rem}
+.cp .hint{margin:0;font-size:.76rem;color:var(--mut)}
+.cp .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.cp .card{border:1px solid var(--bd);border-radius:8px;padding:12px 14px;background:var(--pl)}
+.cp .card .lbl{margin:0 0 5px;font-size:.68rem;font-weight:600;letter-spacing:.05em;
+ text-transform:uppercase;color:var(--mut)}
+.cp .card .val{margin:0;font-size:1.5rem;font-weight:600;letter-spacing:-.02em}
+.cp .card .val .u{font-size:.72rem;font-weight:500;color:var(--mut);margin-left:4px}
+.cp .card .sub{margin:5px 0 0;font-size:.74rem;color:var(--ink2)}
+.cp .chip{display:inline-block;font-size:.72rem;font-weight:600;padding:3px 9px;
+ border-radius:999px;border:1px solid var(--bd);color:var(--ink2)}
+.cp .chip.good{color:var(--gd);border-color:var(--gd)}
+.cp .chip.warn{color:var(--ink);border-color:var(--wn)}
+.cp .chip.crit{color:var(--cr);border-color:var(--cr)}
+.cp table{border-collapse:collapse;width:100%;font-size:.8rem;margin-top:10px}
+.cp th,.cp td{text-align:left;padding:6px 9px;border-bottom:1px solid var(--bd);
+ white-space:nowrap}
+.cp th{color:var(--mut);font-size:.72rem;font-weight:600}
+.cp td{font-variant-numeric:tabular-nums}
+.cp .tl{display:flex;flex-wrap:wrap;gap:3px;margin:10px 0}
+.cp .tl i{width:12px;height:20px;border-radius:3px;background:rgba(137,135,129,.28)}
+.cp .lg{display:flex;gap:14px;flex-wrap:wrap;font-size:.75rem;color:var(--ink2);margin:6px 0}
+.cp .lg b{display:inline-block;width:12px;height:3px;border-radius:2px;margin-right:5px;
+ vertical-align:middle}
+.cp .co{margin:10px 0 0;padding:9px 12px;border-radius:8px;background:var(--pl);
+ border:1px solid var(--bd);font-size:.78rem;color:var(--ink2)}
+.cp .sc{overflow-x:auto}.cp svg{display:block;max-width:100%;height:auto}
+</style>
+"""
+
+_TIER_COLOUR = {
+    "BP_LEVEL_2": STATUS["critical"], "BP_LEVEL_2_SYMPTOM_OVERRIDE": STATUS["critical"],
+    "TIER_1_ANGIOEDEMA": STATUS["critical"], "TIER_1_CONTRAINDICATION": STATUS["serious"],
+    "TIER_2_DISCREPANCY": STATUS["warning"], "BP_LEVEL_1_HIGH": "#eb6834",
+    "BP_LEVEL_1_LOW": "#2a78d6", "TIER_3_INFO": "rgba(137,135,129,.55)",
+}
+
+
+def _esc(s) -> str:
+    return (str("" if s is None else s).replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _pretty(s) -> str:
+    if not s:
+        return ""
+    t = str(s).replace("RULE_", "").replace("_", " ").lower()
+    return t[:1].upper() + t[1:]
+
+
+def _svg_series(series, refs=(), width=880, height=280, y_fmt="{:.0f}",
+                x_labels=None, shade=None):
+    """Minimal line chart. `series` = [(points, colour, dashed, marks)] where marks
+    is a list of (index, colour) drawn as filled dots."""
+    C = PALETTE["light"]
+    ml, mr, mt, mb = 48, 76, 16, 30
+    iw, ih = width - ml - mr, height - mt - mb
+    vals = [v for pts, *_ in series for v in pts if v is not None]
+    vals += [r[0] for r in refs if r[0] is not None]
+    if len(vals) < 2:
+        return "<p class='hint'>not enough data to plot</p>"
+    lo, hi = min(vals), max(vals)
+    pad = max((hi - lo) * 0.12, 0.01)
+    y0, y1 = lo - pad, hi + pad
+    n = max(len(p) for p, *_ in series)
+
+    def X(i):
+        return ml + (0 if n <= 1 else (i / (n - 1)) * iw)
+
+    def Y(v):
+        return mt + ih - ((v - y0) / (y1 - y0)) * ih
+
+    out = [f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet" '
+           f'role="img">']
+    if shade:
+        out.append(f'<rect x="{ml}" y="{mt}" width="{max(X(shade) - ml, 2):.1f}" '
+                   f'height="{ih}" fill="{C["muted"]}" opacity=".09"/>'
+                   f'<text x="{ml + 5}" y="{mt + 12}" fill="{C["muted"]}" '
+                   f'font-size="10">warm-up</text>')
+    for k in range(5):
+        v = y0 + k / 4 * (y1 - y0)
+        out.append(f'<line x1="{ml}" x2="{ml + iw}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" '
+                   f'stroke="{C["grid"]}" stroke-width="1"/>'
+                   f'<text x="{ml - 8}" y="{Y(v) + 4:.1f}" text-anchor="end" '
+                   f'fill="{C["muted"]}" font-size="11">{y_fmt.format(v)}</text>')
+    out.append(f'<line x1="{ml}" x2="{ml + iw}" y1="{mt + ih}" y2="{mt + ih}" '
+               f'stroke="{C["axis"]}" stroke-width="1"/>')
+    for v, colour, text in refs:
+        if v is None or not (y0 <= v <= y1):
+            continue
+        out.append(f'<line x1="{ml}" x2="{ml + iw}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" '
+                   f'stroke="{colour}" stroke-width="2" stroke-dasharray="5 4"/>'
+                   f'<text x="{ml + iw + 6}" y="{Y(v) + 4:.1f}" fill="{C["ink2"]}" '
+                   f'font-size="11">{_esc(text)}</text>')
+    for i, lab in (x_labels or []):
+        out.append(f'<text x="{X(i):.1f}" y="{mt + ih + 19}" text-anchor="middle" '
+                   f'fill="{C["muted"]}" font-size="11">{_esc(lab)}</text>')
+    for pts, colour, dashed, marks in series:
+        d = " ".join(f'{"L" if k else "M"}{X(k):.1f} {Y(v):.1f}'
+                     for k, v in enumerate(pts) if v is not None)
+        if d:
+            out.append(f'<path d="{d}" fill="none" stroke="{colour}" stroke-width="2" '
+                       f'stroke-linejoin="round" stroke-linecap="round"'
+                       + (' stroke-dasharray="6 4"' if dashed else "") + "/>")
+        for idx, mcol in (marks or []):
+            if 0 <= idx < len(pts) and pts[idx] is not None:
+                out.append(f'<circle cx="{X(idx):.1f}" cy="{Y(pts[idx]):.1f}" r="5" '
+                           f'fill="{mcol}" stroke="{C["surface"]}" stroke-width="2"/>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _legend(items):
+    return ('<div class="lg">' + "".join(
+        f'<span><b style="background:{c}"></b>{_esc(t)}</span>' for c, t in items)
+        + "</div>")
+
+
+def _render_dashboard(a: dict) -> str:
+    C, S = PALETTE["light"], STATUS
+    pers = a.get("personalisation") or {}
+    ew = a.get("early_warning") or {}
+    eng = (a.get("rule_engine") or {})
+    cur = eng.get("current") or {}
+    pa = (a.get("predicted_alert") or {})
+    hz = pa.get("horizons") or []
+    h = ['<div class="cp">', DASH_CSS]
+
+    # ---- banner ----
+    first_fire = next((x for x in hz if x.get("fired")), None)
+    if cur.get("is_emergency"):
+        cls, ic = "crit", "&#9888;"
+        t = "Rule engine fired an emergency alert on the latest reading"
+        d = (_pretty(cur.get("rule_id")) + " — the emergency floor is never personalised "
+             "and the engine is authoritative here.")
+    elif ew.get("flagged"):
+        cls, ic = "crit", "&#9888;"
+        t = "Early-warning detector flagged this patient"
+        d = (f"Score {ew['score']} at or above the {ew['budget_pct']}% cut of {ew['cut']}, "
+             f"about {ew['est_lead_days']} days of lead time.")
+    elif first_fire:
+        cls, ic = "watch", "&#9670;"
+        t = (f"{_pretty(first_fire['tier'])} forecast in about "
+             f"{first_fire['days_ahead']} days")
+        d = (f"Predicted SBP {first_fire['sbp']} mmHg would fire "
+             f"{_pretty(first_fire.get('rule_id'))} if the trend holds.")
+    elif cur.get("fired"):
+        cls, ic = "watch", "&#9670;"
+        t = f"{_pretty(cur.get('tier'))} on the latest reading"
+        d = _pretty(cur.get("rule_id")) + ". No further breach forecast."
+    elif a.get("confidence_tier") == "cold_start":
+        cls, ic, t, d = "", "&#9675;", "Cold start — no forecast issued", a.get("note", "")
+    else:
+        cls, ic, t = "good", "&#10003;", "Nothing due"
+        d = ("The engine fired nothing on the latest reading, the forecast stays below "
+             f"the personalised threshold of {pers.get('threshold')} mmHg, and the "
+             "detector is below its cut.")
+    h.append(f'<div class="bn {cls}"><span>{ic}</span><div><h4>{_esc(t)}</h4>'
+             f'<p>{_esc(d)}</p></div></div>')
+
+    # ---- combined: engine on the forecast ----
+    h.append('<div class="pnl acc"><h3>Combined outlook</h3>'
+             '<p class="hint">Forecast vitals passed through the rule engine — '
+             'what fires if the trend holds</p><div class="grid" style="margin-top:12px">')
+    if hz:
+        for x in hz:
+            cc = "crit" if x.get("is_emergency") else ("warn" if x.get("fired") else "good")
+            h.append(
+                f'<div class="card"><p class="lbl">in ~{_esc(x["days_ahead"])} days '
+                f'· +{_esc(x["steps_ahead"])} sessions</p>'
+                f'<p class="val">{_esc(x["sbp"])}'
+                + (f'/{_esc(x["dbp"])}' if x.get("dbp") is not None else "")
+                + '<span class="u">mmHg</span></p>'
+                + (f'<p class="sub">80% {_esc(x["lo80"])} – {_esc(x["hi80"])}</p>'
+                   if x.get("lo80") is not None else '<p class="sub">no interval</p>')
+                + f'<span class="chip {cc}">'
+                  f'{_esc(_pretty(x["tier"]) if x.get("tier") else "No alert")}</span>'
+                + (f'<p class="sub">{_esc(_pretty(x.get("rule_id")))}</p>'
+                   if x.get("rule_id") else "") + "</div>")
+    else:
+        h.append('<p class="hint">No forecast issued — below the cold-start floor.</p>')
+    h.append("</div>")
+    if pa.get("symptom_note"):
+        h.append(f'<p class="co">{_esc(pa.get("basis", ""))}. '
+                 f'{_esc(pa["symptom_note"])}</p>')
+    h.append("</div>")
+
+    # ---- tiles ----
+    ec = ("crit" if cur.get("is_emergency") else "warn" if cur.get("fired") else "good")
+    ew_chip = ("not issued" if not ew else
+               ("&#9888; Flagged" if ew.get("flagged") else "&#10003; Not flagged"))
+    ew_cls = "" if not ew else ("crit" if ew.get("flagged") else "good")
+    h.append(
+        '<div class="grid" style="margin-bottom:16px">'
+        f'<div class="card"><p class="lbl">Engine now · rule engine</p>'
+        f'<p class="val"><span class="chip {ec}">'
+        f'{_esc(_pretty(cur.get("tier")) if cur.get("tier") else "No alert")}</span></p>'
+        f'<p class="sub">{_esc(_pretty(cur.get("rule_id")) or "nothing fired")}</p></div>'
+        f'<div class="card"><p class="lbl">Threshold · M2</p>'
+        f'<p class="val">{_esc(pers.get("threshold", "–"))}<span class="u">mmHg</span></p>'
+        f'<p class="sub">offset {_esc(pers.get("offset", "–"))} mmHg'
+        + (" — capped" if pers.get("capped") else "") + "</p></div>"
+        f'<div class="card"><p class="lbl">Early warning · M3</p>'
+        f'<p class="val"><span class="chip {ew_cls}">{ew_chip}</span></p>'
+        f'<p class="sub">'
+        + (f'score {ew["score"]} vs cut {ew["cut"]}' if ew else "below cold-start floor")
+        + "</p></div>"
+        f'<div class="card"><p class="lbl">Confidence</p>'
+        f'<p class="val" style="font-size:1.1rem">'
+        f'{_esc(str(a.get("confidence_tier", "")).replace("_", " "))}</p>'
+        f'<p class="sub">{_esc(a.get("n_observations", 0))} readings</p></div></div>')
+
+    # ---- Model 1: forecast chart ----
+    hist = a.get("history") or []
+    fc = (a.get("forecast") or {}).get("sbp") or {}
+    fpts = sorted(fc.values(), key=lambda v: v["steps_ahead"])
+    if len(hist) >= 2:
+        obs = [x["sbp"] for x in hist] + [None] * len(fpts)
+        fut = [None] * (len(hist) - 1) + [hist[-1]["sbp"]] + [x["point"] for x in fpts]
+        n = len(obs)
+        xl = [(0, hist[0]["ts"][5:]), (len(hist) // 2, hist[len(hist) // 2]["ts"][5:]),
+              (len(hist) - 1, hist[-1]["ts"][5:])]
+        if fpts:
+            xl.append((n - 1, f"+{fpts[-1]['steps_ahead']} sess"))
+        refs = [(pers.get("threshold"), S["warning"],
+                 f"threshold {pers.get('threshold')}"),
+                (a.get("emergency_floor_mmHg"), S["critical"],
+                 f"floor {a.get('emergency_floor_mmHg')}")]
+        h.append('<div class="pnl"><h3>Model 1 — forecaster</h3>'
+                 '<p class="hint">Observed SBP and the forecast, per session</p>'
+                 + _legend([(C["s1"], "Observed"), (C["s2"], "Forecast"),
+                            (S["warning"], "Threshold"), (S["critical"], "Floor")])
+                 + '<div class="sc">'
+                 + _svg_series([(obs, C["s1"], False, [(len(hist) - 1, C["s1"])]),
+                                (fut, C["s2"], True,
+                                 [(len(hist) + i, C["s2"]) for i in range(len(fpts))])],
+                               refs=refs, x_labels=xl)
+                 + "</div>")
+        if fpts:
+            h.append('<table><thead><tr><th>Horizon</th><th>SBP</th><th>80% interval</th>'
+                     "<th>Days</th><th>vs threshold</th></tr></thead><tbody>")
+            for f in fpts:
+                thr = pers.get("threshold")
+                dl = (f"{'▲ ' if f['point'] >= thr else '▼ '}"
+                      f"{abs(f['point'] - thr):.1f} "
+                      f"{'over' if f['point'] >= thr else 'under'}") if thr else "–"
+                band = (f"{f['lo80']} – {f['hi80']}" if f.get("lo80") is not None else "–")
+                h.append(f"<tr><td>+{f['steps_ahead']} sessions</td><td>{f['point']}</td>"
+                         f"<td>{band}</td><td>{f['days_ahead_est']}</td>"
+                         f"<td>{_esc(dl)}</td></tr>")
+            h.append("</tbody></table>")
+        h.append("</div>")
+
+    # ---- backtest ----
+    bt = a.get("backtest") or {}
+    if bt.get("horizons"):
+        hh = bt["horizons"][0]
+        rows = bt["series"].get(f"h{hh['horizon']}") or []
+        if len(rows) >= 2:
+            xl = [(0, rows[0]["ts"][5:]), (len(rows) // 2, rows[len(rows) // 2]["ts"][5:]),
+                  (len(rows) - 1, rows[-1]["ts"][5:])]
+            h.append('<div class="pnl"><h3>What we predicted, against what happened</h3>'
+                     f'<p class="hint">Each point is the forecast made {hh["horizon"]} '
+                     f'session(s) — about {hh["days_ahead"]} days — before that reading. '
+                     "The features behind it never saw the day they predict.</p>"
+                     + _legend([(C["s1"], "Actual"),
+                                (C["s2"], f"Predicted {hh['days_ahead']} days earlier")])
+                     + '<div class="sc">'
+                     + _svg_series([([r["actual"] for r in rows], C["s1"], False, []),
+                                    ([r["predicted"] for r in rows], C["s2"], True, [])],
+                                   x_labels=xl, height=250)
+                     + "</div><table><thead><tr><th>Horizon</th><th>Days ahead</th>"
+                     "<th>n</th><th>MAE (mmHg)</th><th>within 10</th></tr></thead><tbody>")
+            for x in bt["horizons"]:
+                h.append(f"<tr><td>+{x['horizon']} sessions</td><td>{x['days_ahead']}</td>"
+                         f"<td>{x['n']}</td><td>{x['mae']}</td>"
+                         f"<td>{round(x['within_10'] * 100)}%</td></tr>")
+            h.append("</tbody></table></div>")
+
+    # ---- Model 3: anomaly ----
+    an = a.get("anomaly") or {}
+    if an.get("points") and len(an["points"]) >= 2:
+        pts = an["points"]
+        scores = [p["score"] for p in pts]
+        marks = [(i, S["critical"]) for i, p in enumerate(pts) if p["flagged"]]
+        xl = [(0, pts[0]["ts"][5:]), (len(pts) // 2, pts[len(pts) // 2]["ts"][5:]),
+              (len(pts) - 1, pts[-1]["ts"][5:])]
+        peak = max(pts, key=lambda p: p["score"])
+        h.append('<div class="pnl"><h3>Model 3 — early-warning detector</h3>'
+                 f'<p class="hint">{_esc(an["event_definition"])}</p>'
+                 + _legend([(C["s1"], "Detector score"), (S["warning"], "Alert cut"),
+                            (S["critical"], "Flagged")])
+                 + '<div class="sc">'
+                 + _svg_series([(scores, C["s1"], False, marks)],
+                               refs=[(an["cut"], S["warning"], f"cut {an['cut']}")],
+                               x_labels=xl, height=250, y_fmt="{:.2f}",
+                               shade=an.get("warmup_sessions") or None)
+                 + "</div>"
+                 + '<p class="co">'
+                 + (f'{an["n_flagged"]} of {an["n_settled"]} settled sessions crossed the '
+                    f'cut. Peak {peak["score"]:.3f} on {peak["ts"]}.'
+                    if an["n_flagged"] else
+                    f'No session crossed the cut. Peak {peak["score"]:.3f} on '
+                    f'{peak["ts"]}, leaving {an["cut"] - peak["score"]:.3f} of headroom '
+                    f'at the {an["budget_pct"]}% alert budget.')
+                 + "</p></div>")
+
+    # ---- rule engine ----
+    if eng and not eng.get("error"):
+        tl = "".join(
+            f'<i style="background:{_TIER_COLOUR.get(x["tier"], "rgba(137,135,129,.28)")}" '
+            f'title="{_esc(x["ts"])} {_esc(_pretty(x.get("rule_id")) or "no alert")}"></i>'
+            for x in eng.get("history", []))
+        fired = [x for x in eng.get("history", []) if x.get("fired")][::-1][:12]
+        h.append('<div class="pnl"><h3>Rule engine</h3>'
+                 '<p class="hint">The permanent floor — never trained, never tuned</p>'
+                 f'<div class="tl">{tl}</div>'
+                 f'<p class="hint">{eng.get("fired_count", 0)} of '
+                 f'{len(eng.get("history", []))} readings fired</p>')
+        if fired:
+            h.append("<table><thead><tr><th>Session</th><th>Tier</th><th>Rule</th>"
+                     "</tr></thead><tbody>")
+            for x in fired:
+                h.append(f'<tr><td>{_esc(x["ts"])}</td>'
+                         f'<td>{_esc(_pretty(x["tier"]))}</td>'
+                         f'<td>{_esc(_pretty(x["rule_id"]))}</td></tr>')
+            h.append("</tbody></table>")
+        reg = STORE.registry
+        if reg is not None:
+            blocked = int((reg.status == "BLOCKED_ON_INPUTS").sum())
+            h.append(f'<p class="co">{blocked} of {len(reg)} rule slots are '
+                     "BLOCKED_ON_INPUTS against the training corpus, which carries no "
+                     "symptom, medication or condition columns. The engine is "
+                     "deterministic, so whatever you enter above is evaluated here "
+                     "immediately.</p>")
+        h.append("</div>")
+    elif eng.get("error"):
+        h.append(f'<div class="pnl"><h3>Rule engine</h3>'
+                 f'<p class="co">unavailable: {_esc(eng["error"])}</p></div>')
+
+    # ---- governance ----
+    h.append('<div class="pnl"><h3>Governance</h3><table><tbody>'
+             f'<tr><td>Emergency floor</td><td>{_esc(a.get("emergency_floor_mmHg"))} mmHg'
+             "</td><td>never personalised</td></tr>"
+             f"<tr><td>Population threshold</td><td>{POPULATION_THRESHOLD_MMHG} mmHg</td>"
+             "<td>the offset applies against this, within caps</td></tr>"
+             f'<tr><td>Model version</td><td colspan="2">'
+             f'{_esc(a.get("model_version"))}</td></tr></tbody></table>'
+             '<p class="co">Provider-visible decision support. The ML layer never writes '
+             "a DeviationAlert and never moves an emergency threshold.</p></div>")
+
+    h.append("</div>")
+    return "".join(h)
+
+
 @_maybe_gpu
-def _gradio_predict(readings_text, patient_id, age, sex, dm, symptoms):
+def _gradio_predict(readings_text, patient_id, age, sex, dm, pregnant, hf_type,
+                    provider_target, conditions, medications, symptoms, position,
+                    n_meas, missed_3d, adherence):
     if not STORE.ready:
-        return f"### No model loaded\n\n{STORE.error}", {}
+        return (f'<div class="cp">{DASH_CSS}<div class="bn crit"><span>&#9888;</span>'
+                f"<div><h4>No model loaded</h4><p>{_esc(STORE.error)}</p></div></div></div>",
+                {})
     rows, errors = _parse_readings(readings_text or "")
     if errors:
-        return "### Could not parse the readings\n\n- " + "\n- ".join(errors[:5]), {}
+        return (f'<div class="cp">{DASH_CSS}<div class="bn crit"><span>&#9888;</span>'
+                "<div><h4>Could not parse the readings</h4><p>"
+                + _esc(" · ".join(errors[:4])) + "</p></div></div></div>", {})
     if not rows:
-        return "### Enter at least one reading", {}
-    if symptoms:
-        rows[-1].symptoms = list(symptoms)
+        return (f'<div class="cp">{DASH_CSS}<div class="bn"><span>&#9675;</span>'
+                "<div><h4>Enter at least one reading</h4></div></div></div>", {})
 
-    req = PredictRequest(patient_id=patient_id or "demo",
-                         profile=Profile(age=float(age),
-                                         is_male=1 if sex == "Male" else 0,
-                                         is_dm=1 if dm == "Yes" else 0),
-                         readings=rows)
-    advisory = predict(req).body
+    rows[-1].symptoms = list(symptoms or [])
+    rows[-1].position = position or "SITTING"
+    rows[-1].n_meas = int(n_meas or 2)
+    conds = list(conditions or [])
+    if hf_type and hf_type != "NONE" and "has_hf" not in conds:
+        conds.append("has_hf")
+
+    req = PredictRequest(
+        patient_id=patient_id or "demo",
+        profile=Profile(age=float(age or 65), is_male=1 if sex == "Male" else 0,
+                        is_dm=1 if dm == "Yes" else 0,
+                        is_pregnant=1 if pregnant == "Yes" else 0,
+                        hf_type=hf_type or "NONE", conditions=conds,
+                        medications=list(medications or []),
+                        provider_target=(float(provider_target)
+                                         if provider_target else None),
+                        missed_3d=int(missed_3d or 0),
+                        adherence_7d=float(adherence if adherence is not None else 1.0)),
+        readings=rows)
+
     import json
-    a = json.loads(advisory)
-
-    pers = a.get("personalisation", {})
-    ew = a.get("early_warning") or {}
-    eng = (a.get("rule_engine") or {}).get("current") or {}
-    lines = [f"### {a['patient_id']} — {a['confidence_tier'].replace('_', ' ')}", "",
-             f"**Threshold** {pers.get('threshold')} mmHg · "
-             f"**Floor** {a.get('emergency_floor_mmHg')} mmHg (never personalised)  ",
-             f"**Engine now** {eng.get('tier') or 'no alert'}"
-             + (f" — {eng.get('rule_id')}" if eng.get("rule_id") else "")]
-    for p in (a.get("predicted_alert") or {}).get("horizons", []):
-        lines.append(f"**+{p['steps_ahead']} sessions (~{p['days_ahead']} d)** "
-                     f"SBP {p['sbp']} → {p.get('tier') or 'no alert'}"
-                     + (f" ({p.get('rule_id')})" if p.get("rule_id") else ""))
-    if ew:
-        lines.append(f"**Early warning** {'FLAGGED' if ew['flagged'] else 'not flagged'} "
-                     f"— score {ew['score']} vs cut {ew['cut']}")
-    lines.append("")
-    lines.append("The full dashboard, with all three models charted, is at [/](/).")
-    return "\n".join(lines), a
+    a = json.loads(predict(req).body)
+    return _render_dashboard(a), a
 
 
-with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False) as demo:
-    gr.Markdown("## Cardioplace BP Alerts\nQuick check. The full dashboard — three "
-                "models, rule engine, backtest — is at [/](/).")
+def _gradio_train():
+    if TRAINING.snapshot()["running"]:
+        return "A training run is already in progress."
+    threading.Thread(target=_run_training, daemon=True).start()
+    return ("Started. A full run streams the 250 MB corpus and does a forward-chained "
+            "random search — expect tens of minutes. Press Refresh status for progress.")
+
+
+def _gradio_train_status():
+    s = TRAINING.snapshot()
+    head = ("running" if s["running"] else
+            f"finished (rc={s['returncode']})" if s["returncode"] is not None else "idle")
+    return f"[{head}] started {s['started_at']}\n" + "\n".join(s["tail"][-20:])
+
+
+with gr.Blocks(title="Cardioplace BP Alerts", analytics_enabled=False,
+               css=".gradio-container{max-width:1500px!important}") as demo:
+    gr.Markdown("## Cardioplace BP Alerts\n"
+                "Forecasting · personalisation · early warning · deterministic rule engine")
     with gr.Row():
-        with gr.Column(scale=2):
-            g_readings = gr.Textbox(label="Session readings", lines=10,
-                                    info="One per line: YYYY-MM-DD, SBP, DBP",
-                                    value="\n".join(f"2026-01-{d:02d}, {150 + (d % 7)}, "
-                                                    f"{78 + (d % 5)}" for d in range(1, 26)))
-            g_symp = gr.CheckboxGroup(SYMPTOM_KEYS[:10], label="Symptoms today")
         with gr.Column(scale=1):
+            gr.Markdown("### Patient")
             g_pid = gr.Textbox(label="Patient ID", value="demo-001")
-            g_age = gr.Number(label="Age", value=68, minimum=18, maximum=110)
-            g_sex = gr.Radio(["Female", "Male"], label="Sex", value="Male")
-            g_dm = gr.Radio(["No", "Yes"], label="Diabetes", value="No")
+            with gr.Row():
+                g_age = gr.Number(label="Age", value=68, minimum=18, maximum=110)
+                g_sex = gr.Radio(["Female", "Male"], label="Sex", value="Male")
+            with gr.Row():
+                g_dm = gr.Radio(["No", "Yes"], label="Diabetes", value="No")
+                g_preg = gr.Radio(["No", "Yes"], label="Pregnant", value="No")
+            with gr.Row():
+                g_hf = gr.Dropdown(["NONE", "HFREF", "HFPEF"], label="Heart failure",
+                                   value="NONE")
+                g_pt = gr.Number(label="Provider SBP target", value=None)
+            g_cond = gr.CheckboxGroup(CONDITION_KEYS, label="Conditions")
+            g_med = gr.CheckboxGroup(MED_KEYS, label="Medications")
+            with gr.Row():
+                g_missed = gr.Number(label="Missed doses (3d)", value=0,
+                                     minimum=0, maximum=3)
+                g_adh = gr.Number(label="Adherence 7d", value=1.0, minimum=0, maximum=1)
+
+            gr.Markdown("### Readings")
+            g_readings = gr.Textbox(
+                label="Session history", lines=10,
+                info="One per line: date, SBP, DBP[, pulse, weight]",
+                value=_sample_readings())
+            gr.Markdown("### Today's symptoms  \n"
+                        "<small>applied to the most recent reading — these are what "
+                        "unlock the symptom-gated rules</small>")
+            g_symp = gr.CheckboxGroup(SYMPTOM_KEYS, label="Symptoms")
+            with gr.Row():
+                g_pos = gr.Dropdown(["SITTING", "STANDING", "LYING"], label="Position",
+                                    value="SITTING")
+                g_nmeas = gr.Number(label="Readings in session", value=2,
+                                    minimum=1, maximum=5)
             g_btn = gr.Button("Get advisory", variant="primary")
-    g_summary = gr.Markdown()
-    with gr.Accordion("Raw advisory", open=False):
-        g_json = gr.JSON()
-    g_btn.click(_gradio_predict, [g_readings, g_pid, g_age, g_sex, g_dm, g_symp],
-                [g_summary, g_json])
+
+            with gr.Accordion("Train the model", open=False):
+                gr.Markdown("Runs the full pipeline: ingest → validate → transform → "
+                            "model trainer. Heavy for a free Space; training locally and "
+                            "letting this serve the committed bundle is usually better.")
+                g_train = gr.Button("Run training pipeline")
+                g_refresh = gr.Button("Refresh status")
+                g_tstatus = gr.Textbox(label="Pipeline status", lines=8,
+                                       value="idle", interactive=False)
+
+        with gr.Column(scale=2):
+            g_out = gr.HTML(value=f'<div class="cp">{DASH_CSS}<div class="bn">'
+                                  "<span>&#9675;</span><div><h4>No advisory yet</h4>"
+                                  "<p>Enter the patient's history and select "
+                                  "<b>Get advisory</b>. The forecaster needs 7 readings; "
+                                  "the rule engine fires on every reading regardless.</p>"
+                                  "</div></div></div>")
+            with gr.Accordion("Raw advisory (JSON)", open=False):
+                g_json = gr.JSON()
+
+    g_btn.click(_gradio_predict,
+                [g_readings, g_pid, g_age, g_sex, g_dm, g_preg, g_hf, g_pt,
+                 g_cond, g_med, g_symp, g_pos, g_nmeas, g_missed, g_adh],
+                [g_out, g_json])
+    g_train.click(_gradio_train, None, g_tstatus)
+    g_refresh.click(_gradio_train_status, None, g_tstatus)
 
 # Off-Space, FastAPI owns the server and Gradio is mounted under it.
 app = gr.mount_gradio_app(app, demo, path="/gradio")
@@ -684,26 +1149,31 @@ def _server_port() -> int:
     return int(os.getenv("PORT") or os.getenv("GRADIO_SERVER_PORT") or 7860)
 
 
-def _serve_on_space(port: int) -> None:
-    """Gradio owns the server; the FastAPI routes are transplanted onto its app.
+# A Gradio Space may IMPORT this module and launch `demo` itself rather than running
+# it as __main__. Anything the dashboard depends on must therefore live at import
+# time, in `demo` -- which it now does: the Blocks above renders the whole view from
+# the server, with no /static fetch and no /api call. The model is loaded here for
+# the same reason: the FastAPI lifespan does not run when Gradio owns the server.
+if os.getenv("SPACE_ID") and not STORE.ready:
+    STORE.load()
 
-    A Space registers with the platform through Gradio's launch path -- a custom
-    uvicorn with Gradio merely mounted is reaped shortly after startup. Routes are
-    PREPENDED because Gradio's app ends in a catch-all and Starlette stops at the
-    first match; appended routes silently 404. "/" is included, so the dashboard is
-    the landing page rather than Gradio's own UI.
+
+def _serve_on_space(port: int) -> None:
+    """Run-as-__main__ path on a Space: Gradio owns the server, FastAPI routes are
+    transplanted onto its app so the templates/ view and the REST API stay reachable.
+
+    Routes are PREPENDED because Gradio's app ends in a catch-all and Starlette stops
+    at the first match; appended routes silently 404. This is a convenience only --
+    the Gradio Blocks alone is a complete dashboard if this never runs.
     """
-    STORE.load()   # the FastAPI lifespan does not run when Gradio owns the server
+    STORE.load()
     demo.launch(server_name="0.0.0.0", server_port=port,
                 prevent_thread_lock=True, share=False)
-
     ours = [r for r in app.routes
-            if getattr(r, "path", "") == "/"
-            or getattr(r, "path", "").startswith(("/api", "/static"))]
+            if getattr(r, "path", "").startswith(("/api", "/static"))]
     for route in reversed(ours):
         demo.app.routes.insert(0, route)
-    logging.info("grafted %d FastAPI routes ahead of Gradio's catch-all "
-                 "(dashboard at /, Gradio at /gradio)", len(ours))
+    logging.info("grafted %d FastAPI routes onto the Gradio app", len(ours))
     demo.block_thread()
 
 
